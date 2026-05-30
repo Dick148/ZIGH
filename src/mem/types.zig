@@ -60,11 +60,11 @@ pub fn packU64(value: anytype, tid: TypeId) u64 {
 /// Caller owns the returned slice (uses provided allocator).
 pub fn formatU64(v: u64, tid: TypeId, allocator: std.mem.Allocator) ![]u8 {
     return switch (tid) {
-        .int8 => std.fmt.allocPrint(allocator, "{d}", .{@as(i8, @truncate(v))}),
+        .int8 => std.fmt.allocPrint(allocator, "{d}", .{@as(i8, @bitCast(@as(u8, @truncate(v))))}),
         .uint8 => std.fmt.allocPrint(allocator, "{d}", .{@as(u8, @truncate(v))}),
-        .int16 => std.fmt.allocPrint(allocator, "{d}", .{@as(i16, @truncate(v))}),
+        .int16 => std.fmt.allocPrint(allocator, "{d}", .{@as(i16, @bitCast(@as(u16, @truncate(v))))}),
         .uint16 => std.fmt.allocPrint(allocator, "{d}", .{@as(u16, @truncate(v))}),
-        .int32 => std.fmt.allocPrint(allocator, "{d}", .{@as(i32, @truncate(v))}),
+        .int32 => std.fmt.allocPrint(allocator, "{d}", .{@as(i32, @bitCast(@as(u32, @truncate(v))))}),
         .uint32 => std.fmt.allocPrint(allocator, "{d}", .{@as(u32, @truncate(v))}),
         .int64 => std.fmt.allocPrint(allocator, "{d}", .{@as(i64, @bitCast(v))}),
         .uint64 => std.fmt.allocPrint(allocator, "{d}", .{v}),

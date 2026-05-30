@@ -63,7 +63,7 @@ pub fn deinit(self: *Daemon) void {
     @atomicStore(u32, &self.shm_ptr.agentStatus, shm.STATUS_SHUTDOWN, .release);
     shm.bumpVersion(self.shm_ptr);
 
-    if (self.mem_file) |fd| _ = posix.close(fd);
+    if (self.mem_file) |fd| _ = std.c.close(fd);
 
     // Unlink needs the name. Since we own the allocation of the name buffer,
     // we just pass what we have. But shm_name points into a stack buffer from init...
