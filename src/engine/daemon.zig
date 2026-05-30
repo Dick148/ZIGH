@@ -117,12 +117,20 @@ fn findSlotByName(self: *Daemon, name: []const u8) ?u32 {
 fn clearSlot(self: *Daemon, index: u32) void {
     self.shm_ptr.cmdSlots[index].mode = 0;
     @memset(&self.lock_names[index], 0);
-    // Re-count active slots
     var count: u32 = 0;
     for (0..shm.MAX_CMD_SLOTS) |i| {
         if (self.shm_ptr.cmdSlots[i].mode & shm.MODE_ENABLED != 0) count += 1;
     }
     self.shm_ptr.cmdCount = count;
+    shm.bumpVersion(self.shm_ptr);
+}
+
+fn clearAllSlots(self: *Daemon) void {
+    for (0..shm.MAX_CMD_SLOTS) |i| {
+        self.shm_ptr.cmdSlots[i].mode = 0;
+        @memset(&self.lock_names[i], 0);
+    }
+    self.shm_ptr.cmdCount = 0;
     shm.bumpVersion(self.shm_ptr);
 }
 
@@ -202,6 +210,45 @@ pub const Handler = struct {
                     return std.fmt.allocPrint(allocator, "{{\"value\":{d}}}", .{val});
                 }
                 return allocator.dupe(u8, "{\"err\":\"missing addr\"}");
+            },
+            .req_cheat_start => {
+                // Payload: JSON array of lock objects [{name,value,type,address},...]
+                // Simple parse: find each {...} block
+                self.daemon.clearAllSlots();
+                var pos: usize = 0;
+                const p = payload;
+                while (pos < p.len) {
+                    // Find next '{'
+                    const open = std.mem.indexOfScalarPos(u8, p, pos, '{') orelse break;
+                    const close = std.mem.indexOfScalarPos(u8, p, open, '}') orelse break;
+                    const obj = p[open .. close + 1];
+                    pos = close + 1;
+
+                    const name = parseKVPayload(obj, "name") orelse continue;
+                    const val_str = parseKVPayload(obj, "value") orelse continue;
+                    const val = std.fmt.parseUnsigned(u64, val_str, 10) catch 0;
+                    const tid_str = parseKVPayload(obj, "type") orelse "u32";
+                    const tid = types.TypeId.fromString(tid_str) orelse .uint32;
+                    const addr_str = parseKVPayload(obj, "address") orelse "0";
+                    const rva = parseAddressRva(addr_str) catch 0;
+                    const base = self.daemon.shm_ptr.initParams.targetModuleBase;
+
+                    const slot_idx = self.daemon.findFreeSlot() orelse break;
+                    self.daemon.setSlot(slot_idx, shm.MODE_ENABLED | shm.MODE_LOCK | shm.MODE_READBACK, tid, val, rva, base, &.{}, 0) catch continue;
+                    @memcpy(self.daemon.lock_names[slot_idx][0..@min(name.len, 31)], name[0..@min(name.len, 31)]);
+                }
+                // Re-count
+                var active: u32 = 0;
+                for (0..shm.MAX_CMD_SLOTS) |j| {
+                    if (self.daemon.shm_ptr.cmdSlots[j].mode & shm.MODE_ENABLED != 0) active += 1;
+                }
+                self.daemon.shm_ptr.cmdCount = active;
+                shm.bumpVersion(self.daemon.shm_ptr);
+                return std.fmt.allocPrint(allocator, "{{\"ok\":true,\"locks\":{d}}}", .{active});
+            },
+            .req_cheat_stop => {
+                self.daemon.clearAllSlots();
+                return allocator.dupe(u8, "{\"ok\":true}");
             },
             .req_ping => return allocator.dupe(u8, "{\"pong\":true}"),
             .req_shutdown => return allocator.dupe(u8, "{\"ok\":true}"),

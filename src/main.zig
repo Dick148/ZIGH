@@ -12,7 +12,6 @@ const linux = std.os.linux;
 var gpa_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const alloc = gpa_instance.allocator();
 
-var loaded_cheat: ?cheat.CheatFile = null;
 
 const PID_FILE = "/tmp/zigh_daemon.pid";
 
@@ -157,17 +156,29 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
         },
         .@"cheat-load" => {
             if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh cheat-load <file>\n", .{}); return; }
-            const cf = cheat.loadFile(alloc, pa.positional.items[0]) catch |e| { std.debug.print("Load error: {}\n", .{e}); return; };
+            var cf = cheat.loadFile(alloc, pa.positional.items[0]) catch |e| { std.debug.print("Load error: {}\n", .{e}); return; };
             std.debug.print("Loaded: {s} ({s}), {d} locks\n", .{ cf.game, cf.process, cf.locks.len });
-            if (loaded_cheat) |*old| old.deinit(alloc);
-            loaded_cheat = cf;
+            for (cf.locks) |l| std.debug.print("  {s}: {s} type={s}\n", .{ l.name, l.address, @tagName(l.type) });
+
+            // Send to daemon immediately
+            var json: std.ArrayList(u8) = .empty;
+            try json.appendSlice(alloc, "[");
+            for (cf.locks, 0..) |lock, i| {
+                if (i > 0) try json.append(alloc, ',');
+                var buf: [256]u8 = undefined;
+                const entry = try std.fmt.bufPrint(&buf, "{{\"name\":\"{s}\",\"value\":\"{d}\",\"type\":\"{s}\",\"address\":\"{s}\"}}", .{ lock.name, lock.default, @tagName(lock.type), lock.address });
+                try json.appendSlice(alloc, entry);
+            }
+            try json.appendSlice(alloc, "]");
+            defer json.deinit(alloc);
+            const resp = try client.send(alloc, .req_cheat_start, json.items);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+            cf.deinit(alloc);
         },
         .@"cheat-start" => {
-            const cf = loaded_cheat orelse { std.debug.print("No cheat loaded.\n", .{}); return; };
-            _ = cf;
-            const payload = try std.fmt.allocPrint(alloc, "{{\"file\":\"?\"}}", .{});
-            defer alloc.free(payload);
-            const resp = try client.send(alloc, .req_cheat_start, payload);
+            // Re-send if loaded_cheat set (same process only), or just show status
+            const resp = try client.send(alloc, .req_status, "");
             defer alloc.free(resp);
             std.debug.print("{s}\n", .{resp});
         },
