@@ -116,8 +116,11 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
             std.debug.print("{s}\n", .{resp});
         },
         .@"lock-add" => {
-            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh lock-add <name> <value>\n", .{}); return; }
-            const payload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"value\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1] });
+            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh lock-add <name> <value> [--type f32] [--addr 0x...] [--chain 0x10,0x20]\n", .{}); return; }
+            const tid = pa.getOpt("type") orelse "u32";
+            const addr = pa.getOpt("addr") orelse "0";
+            const chain = pa.getOpt("chain") orelse "";
+            const payload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"value\":\"{s}\",\"type\":\"{s}\",\"address\":\"{s}\",\"chain\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1], tid, addr, chain });
             defer alloc.free(payload);
             const resp = try client.send(alloc, .req_lock_add, payload);
             defer alloc.free(resp);
