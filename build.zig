@@ -18,6 +18,21 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Agent shared library
+    const agent_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/agent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const agent = b.addLibrary(.{
+        .name = "zigh_agent",
+        .root_module = agent_mod,
+        .linkage = .dynamic,
+    });
+    b.installArtifact(agent);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);

@@ -7,6 +7,7 @@ const types = @import("mem/types.zig");
 const cheat = @import("cheat/mod.zig");
 const socket = @import("ipc/socket.zig");
 const daemon_mod = @import("engine/daemon.zig");
+const injector = @import("agent/inject.zig");
 const linux = std.os.linux;
 
 var gpa_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
         .help => cli.printHelp(),
         .version => printVersion(),
         .daemon => try cmdDaemon(&pa),
+        .inject => try cmdInject(&pa),
         else => try cmdViaSocket(&pa),
     }
 }
@@ -80,6 +82,31 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
     server.serve() catch |err| {
         std.debug.print("[zigh] Daemon stopped: {}\n", .{err});
     };
+}
+
+fn cmdInject(pa: *const cli.ParsedArgs) !void {
+    if (pa.positional.items.len < 2) {
+        std.debug.print("Usage: zigh inject <pid> <agent.so>\n", .{});
+        std.debug.print("  Injects the agent shared library into the target process.\n", .{});
+        std.debug.print("  The agent.so is built alongside zigh (zig-out/lib/libzigh_agent.so)\n", .{});
+        return;
+    }
+    const pid = std.fmt.parseUnsigned(u32, pa.positional.items[0], 10) catch {
+        std.debug.print("Invalid PID: {s}\n", .{pa.positional.items[0]});
+        return;
+    };
+    const so_path = pa.positional.items[1];
+    var path_buf: [512]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{so_path}) catch {
+        std.debug.print("Path too long\n", .{});
+        return;
+    };
+    std.debug.print("Injecting {s} into PID {d}...\n", .{ path_z, pid });
+    injector.inject(pid, path_z) catch |err| {
+        std.debug.print("Injection failed: {}\n", .{err});
+        return;
+    };
+    std.debug.print("Injection successful!\n", .{});
 }
 
 // ─── Socket client commands ──────────────────────────────────────────────
@@ -187,7 +214,8 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
             defer alloc.free(resp);
             std.debug.print("{s}\n", .{resp});
         },
-        .call, .inject => std.debug.print("Not yet on socket.\n", .{}),
+        .call => std.debug.print("call: not yet implemented\n", .{}),
+        .inject => std.debug.print("inject: handled standalone\n", .{}),
         else => unreachable,
     }
 }
