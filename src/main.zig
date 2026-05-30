@@ -1,44 +1,31 @@
 // ZIGH — ZIGH Is Game Hacker
-// Entry point: CLI routing → daemon / one-shot / status
+// CLI → Unix socket → Daemon
 
 const std = @import("std");
 const cli = @import("cli/parser.zig");
 const types = @import("mem/types.zig");
-const mem = @import("mem/mod.zig");
-const daemon_mod = @import("engine/daemon.zig");
 const cheat = @import("cheat/mod.zig");
-const shm_mod = @import("ipc/shm.zig");
+const socket = @import("ipc/socket.zig");
+const daemon_mod = @import("engine/daemon.zig");
+const linux = std.os.linux;
 
 var gpa_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const alloc = gpa_instance.allocator();
 
 var loaded_cheat: ?cheat.CheatFile = null;
 
+const PID_FILE = "/tmp/zigh_daemon.pid";
+
 pub fn main(init: std.process.Init) !void {
     defer gpa_instance.deinit();
     const args_slice = try init.minimal.args.toSlice(alloc);
-    // Convert [:0]const u8 → []const u8 for the parser
     var args: [][]const u8 = undefined;
-    args = alloc.alloc([]const u8, args_slice.len) catch {
-        cli.printHelp();
-        return;
-    };
+    args = alloc.alloc([]const u8, args_slice.len) catch { cli.printHelp(); return; };
     for (args_slice, 0..) |a, i| args[i] = a;
 
-    if (args.len < 2) {
-        cli.printHelp();
-        return;
-    }
-
-    const parsed = cli.parseArgs(alloc, args) catch |err| {
-        std.debug.print("Error parsing arguments: {}\n", .{err});
-        return;
-    };
-    if (parsed == null) {
-        std.debug.print("Unknown command: {s}\n", .{args[1]});
-        cli.printHelp();
-        return;
-    }
+    if (args.len < 2) { cli.printHelp(); return; }
+    const parsed = cli.parseArgs(alloc, args) catch |err| { std.debug.print("Error: {}\n", .{err}); return; };
+    if (parsed == null) { std.debug.print("Unknown: {s}\n", .{args[1]}); cli.printHelp(); return; }
     var pa = parsed.?;
     defer pa.deinit();
 
@@ -46,33 +33,15 @@ pub fn main(init: std.process.Init) !void {
         .help => cli.printHelp(),
         .version => printVersion(),
         .daemon => try cmdDaemon(&pa),
-        .status => try cmdStatus(&pa),
-        .@"lock-add" => try cmdLockAdd(&pa),
-        .@"lock-remove" => try cmdLockRemove(&pa),
-        .@"lock-list" => try cmdLockList(&pa),
-        .write => try cmdWrite(&pa),
-        .read => try cmdRead(&pa),
-        .@"cheat-load" => try cmdCheatLoad(&pa),
-        .@"cheat-start" => try cmdCheatStart(&pa),
-        .@"cheat-stop" => try cmdCheatStop(&pa),
-        .inject => std.debug.print("inject: not yet implemented\n", .{}),
-        .call => std.debug.print("call: not yet implemented\n", .{}),
+        else => try cmdViaSocket(&pa),
     }
 }
 
 fn printVersion() void {
-    std.debug.print("ZIGH v0.1.0 — ZIGH Is Game Hacker\nBuilt with Zig {s}\nTarget: Linux x86_64\n", .{"0.16.0"});
+    std.debug.print("ZIGH v0.2.0 — ZIGH Is Game Hacker\n", .{});
 }
 
-// ─── Command implementations ────────────────────────────────────────────
-
-var active_daemon: ?*daemon_mod.Daemon = null;
-
-fn getDaemon() !*daemon_mod.Daemon {
-    if (active_daemon) |d| return d;
-    std.debug.print("No active daemon. Run 'zigh daemon --pid <id>' first.\n", .{});
-    return error.NoDaemon;
-}
+// ─── Daemon mode ────────────────────────────────────────────────────────
 
 fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
     const pid_str = pa.getOpt("pid") orelse {
@@ -87,179 +56,124 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
         return;
     };
 
-    const daemon_ptr = try alloc.create(daemon_mod.Daemon);
-    daemon_ptr.* = try daemon_mod.Daemon.init(alloc, pid, 0); // engine=0 (generic)
-    active_daemon = daemon_ptr;
+    var d = try daemon_mod.Daemon.init(alloc, pid, 0);
+    defer d.deinit();
 
-    std.debug.print("[zigh] Daemon attached to PID {d}\n", .{pid});
-    std.debug.print("[zigh] Shared memory: /dev/shm/zigh_{d}_0\n", .{pid});
-    std.debug.print("[zigh] Ready for commands.\n", .{});
+    // Write PID file
+    var pid_buf: [32]u8 = undefined;
+    const pid_content = try std.fmt.bufPrintZ(&pid_buf, "{d}\n", .{pid});
+    const fd = linux.open(PID_FILE, linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (@as(isize, @bitCast(fd)) < 0) { std.debug.print("Cannot write PID file\n", .{}); return; }
+    _ = linux.write(@intCast(fd), pid_content.ptr, pid_content.len);
+    _ = linux.close(@intCast(fd));
+
+    // Socket path
+    var sock_buf: [64]u8 = undefined;
+    const sock_path = try std.fmt.bufPrintZ(&sock_buf, "/tmp/zigh_{d}.sock", .{pid});
+
+    const handler = daemon_mod.Handler{ .daemon = &d };
+    var server = try socket.Server(daemon_mod.Handler).init(alloc, sock_path, handler);
+    defer server.deinit();
+
+    std.debug.print("[zigh] Daemon on {s} for PID {d}\n", .{ sock_path, pid });
+
+    // Block serving
+    server.serve() catch |err| {
+        std.debug.print("[zigh] Daemon stopped: {}\n", .{err});
+    };
 }
 
-fn cmdStatus(pa: *const cli.ParsedArgs) !void {
-    _ = pa;
-    const d = try getDaemon();
-    var results: [64]daemon_mod.Daemon.ReadResult = undefined;
-    const count = d.readBack(&results);
-    std.debug.print("┌──── ZIGH Status ──────────────────────\n", .{});
-    std.debug.print("│ PID:  {d}\n", .{d.pid});
-    std.debug.print("│ Engine: {d} (generic)\n", .{d.engine});
-    std.debug.print("│ Active locks: {d}\n", .{count});
-    if (count > 0) {
-        std.debug.print("│\n", .{});
-        for (results[0..count]) |r| {
-            if (r.hasError) {
-                std.debug.print("│  slot{d}: [ERROR]\n", .{r.slotId});
-            } else {
-                std.debug.print("│  slot{d}: 0x{x:0>16}\n", .{ r.slotId, r.value });
-            }
-        }
-    }
-    std.debug.print("└────────────────────────────────────────\n", .{});
+// ─── Socket client commands ──────────────────────────────────────────────
+
+fn getPid() !u32 {
+    const fd = linux.open(PID_FILE, linux.O{}, 0);
+    if (@as(isize, @bitCast(fd)) < 0) return error.NoDaemon;
+    defer _ = linux.close(@intCast(fd));
+    var buf: [32]u8 = undefined;
+    const n = linux.read(@intCast(fd), &buf, buf.len);
+    if (n == 0) return error.NoDaemon;
+    return std.fmt.parseUnsigned(u32, std.mem.trimEnd(u8, buf[0..n], "\n\r"), 10) catch error.NoDaemon;
 }
 
-fn cmdLockAdd(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 2) {
-        std.debug.print("Usage: zigh lock-add <name> <value> [--type f32] [--addr 0x...] [--chain 0x10,0x20]\n", .{});
-        return;
-    }
-    std.debug.print("[lock-add] '{s}' = {s} — daemon required, not yet wired\n", .{ pa.positional.items[0], pa.positional.items[1] });
+fn connect() !socket.Client {
+    const pid = try getPid();
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "/tmp/zigh_{d}.sock", .{pid});
+    return socket.Client.connect(path);
 }
 
-fn cmdLockRemove(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 1) {
-        std.debug.print("Usage: zigh lock-remove <name>\n", .{});
-        return;
-    }
-    std.debug.print("[lock-remove] '{s}' — daemon required, not yet wired\n", .{pa.positional.items[0]});
-}
-
-fn cmdLockList(pa: *const cli.ParsedArgs) !void {
-    _ = pa;
-    const d = try getDaemon();
-    var results: [64]daemon_mod.Daemon.ReadResult = undefined;
-    const count = d.readBack(&results);
-    if (count == 0) {
-        std.debug.print("No active locks.\n", .{});
-        return;
-    }
-    for (results[0..count]) |r| {
-        std.debug.print("  lock slot{d}: 0x{x:0>16} {s}\n", .{ r.slotId, r.value, if (r.hasError) "[ERR]" else "" });
-    }
-}
-
-fn cmdWrite(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 2) {
-        std.debug.print("Usage: zigh write <addr> <value> [--type f32]\n", .{});
-        return;
-    }
-    const addr_str = pa.positional.items[0];
-    const val_str = pa.positional.items[1];
-    const tid_str = pa.getOpt("type") orelse "u32";
-
-    const addr = parseHexOrDec(usize, addr_str) catch {
-        std.debug.print("Invalid address: {s}\n", .{addr_str});
+fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
+    var client = connect() catch |err| {
+        std.debug.print("Cannot connect to daemon: {}\n", .{err});
         return;
     };
-    const tid = types.TypeId.fromString(tid_str) orelse {
-        std.debug.print("Unknown type: {s}\n", .{tid_str});
-        return;
-    };
+    defer client.deinit();
 
-    const d = try getDaemon();
-    const value: u64 = switch (tid) {
-        .float32, .float64 => blk: {
-            const f = std.fmt.parseFloat(f64, val_str) catch {
-                std.debug.print("Invalid float: {s}\n", .{val_str});
-                return;
-            };
-            break :blk @as(u64, @bitCast(@as(f64, f)));
+    switch (pa.cmd) {
+        .status => {
+            const resp = try client.send(alloc, .req_status, "");
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
         },
-        else => parseHexOrDec(u64, val_str) catch {
-            std.debug.print("Invalid value: {s}\n", .{val_str});
-            return;
+        .@"lock-add" => {
+            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh lock-add <name> <value>\n", .{}); return; }
+            const payload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"value\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1] });
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_lock_add, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
         },
-    };
-
-    try d.writeOnce(addr, value, tid);
-    std.debug.print("Wrote 0x{x} → 0x{x} ({s})\n", .{ value, addr, @tagName(tid) });
-}
-
-fn cmdRead(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 1) {
-        std.debug.print("Usage: zigh read <addr> [--type f32]\n", .{});
-        return;
+        .@"lock-remove" => {
+            if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh lock-remove <name>\n", .{}); return; }
+            const payload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\"}}", .{pa.positional.items[0]});
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_lock_remove, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .@"lock-list" => {
+            const resp = try client.send(alloc, .req_lock_list, "");
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .write => {
+            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh write <addr> <value>\n", .{}); return; }
+            const payload = try std.fmt.allocPrint(alloc, "{{\"addr\":\"{s}\",\"value\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1] });
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_write, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .read => {
+            if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh read <addr>\n", .{}); return; }
+            const payload = try std.fmt.allocPrint(alloc, "{{\"addr\":\"{s}\"}}", .{pa.positional.items[0]});
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_read, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .@"cheat-load" => {
+            if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh cheat-load <file>\n", .{}); return; }
+            const cf = cheat.loadFile(alloc, pa.positional.items[0]) catch |e| { std.debug.print("Load error: {}\n", .{e}); return; };
+            std.debug.print("Loaded: {s} ({s}), {d} locks\n", .{ cf.game, cf.process, cf.locks.len });
+            if (loaded_cheat) |*old| old.deinit(alloc);
+            loaded_cheat = cf;
+        },
+        .@"cheat-start" => {
+            const cf = loaded_cheat orelse { std.debug.print("No cheat loaded.\n", .{}); return; };
+            _ = cf;
+            const payload = try std.fmt.allocPrint(alloc, "{{\"file\":\"?\"}}", .{});
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_cheat_start, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .@"cheat-stop" => {
+            const resp = try client.send(alloc, .req_cheat_stop, "");
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
+        .call, .inject => std.debug.print("Not yet on socket.\n", .{}),
+        else => unreachable,
     }
-    const addr_str = pa.positional.items[0];
-    const tid_str = pa.getOpt("type") orelse "u32";
-
-    const addr = parseHexOrDec(usize, addr_str) catch {
-        std.debug.print("Invalid address: {s}\n", .{addr_str});
-        return;
-    };
-    const tid = types.TypeId.fromString(tid_str) orelse {
-        std.debug.print("Unknown type: {s}\n", .{tid_str});
-        return;
-    };
-
-    const d = try getDaemon();
-    const value = try d.readMem(addr, tid);
-    const formatted = try types.formatU64(value, tid, alloc);
-    defer alloc.free(formatted);
-    std.debug.print("0x{x}: {s}\n", .{ addr, formatted });
-}
-
-fn cmdCheatLoad(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh cheat-load <file.yaml>\n", .{}); return; }
-    const path = pa.positional.items[0];
-    const cf = cheat.loadFile(alloc, path) catch |err| {
-        std.debug.print("Failed to load: {}\n", .{err});
-        return;
-    };
-    std.debug.print("Loaded: {s} ({s})\n", .{ cf.game, cf.process });
-    std.debug.print("  Locks: {d}\n", .{cf.locks.len});
-    for (cf.locks) |l| {
-        std.debug.print("    {s}: {s} type={s} default=0x{x}\n", .{ l.name, l.address, @tagName(l.type), l.default });
-    }
-    if (cf.remote_calls.len > 0) std.debug.print("  Calls: {d}\n", .{cf.remote_calls.len});
-    if (loaded_cheat) |*old| old.deinit(alloc);
-    loaded_cheat = cf;
-}
-
-fn cmdCheatStart(pa: *const cli.ParsedArgs) !void {
-    _ = pa;
-    const cf = loaded_cheat orelse { std.debug.print("No cheat loaded.\n", .{}); return; };
-    const d = try getDaemon();
-    for (cf.locks, 0..) |lock, i| {
-        const mode = shm_mod.MODE_ENABLED | shm_mod.MODE_LOCK | shm_mod.MODE_READBACK;
-        const base = d.shm_ptr.initParams.targetModuleBase;
-        const rva = try parseAddressRva(lock.address);
-        try d.setSlot(@intCast(i), mode, lock.type, lock.default, rva, base, lock.chain, @intCast(lock.chain.len));
-    }
-    d.shm_ptr.cmdCount = @intCast(cf.locks.len);
-    shm_mod.bumpVersion(d.shm_ptr);
-    std.debug.print("Activated {d} locks.\n", .{cf.locks.len});
-}
-
-fn cmdCheatStop(pa: *const cli.ParsedArgs) !void {
-    _ = pa;
-    const d = try getDaemon();
-    for (0..shm_mod.MAX_CMD_SLOTS) |i| d.shm_ptr.cmdSlots[i].mode = 0;
-    d.shm_ptr.cmdCount = 0;
-    shm_mod.bumpVersion(d.shm_ptr);
-    std.debug.print("All locks released.\n", .{});
-}
-
-fn parseAddressRva(addr: []const u8) !u64 {
-    if (std.mem.indexOfScalar(u8, addr, '+')) |plus| return parseHexOrDec(u64, addr[plus + 1 ..]);
-    return parseHexOrDec(u64, addr);
-}
-
-// ─── Utilities ──────────────────────────────────────────────────────────
-
-fn parseHexOrDec(comptime T: type, s: []const u8) !T {
-    if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "0X")) {
-        return std.fmt.parseUnsigned(T, s[2..], 16);
-    }
-    return std.fmt.parseUnsigned(T, s, 10);
 }

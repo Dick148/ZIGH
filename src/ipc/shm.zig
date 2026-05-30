@@ -100,7 +100,7 @@ pub fn open(name: [:0]const u8) !*align(4096) SharedMemory {
 
 /// Unmap + unlink shared memory.
 pub fn destroy(shm_ptr: *align(4096) SharedMemory, name: [:0]const u8) void {
-    const ptr: [*]align(std.mem.page_size) u8 = @ptrCast(@alignCast(shm_ptr));
+    const ptr: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(shm_ptr));
     posix.munmap(ptr[0..SHM_SIZE]);
     _ = c.shm_unlink(name);
 }
