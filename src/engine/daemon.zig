@@ -251,6 +251,54 @@ pub const Handler = struct {
                 return allocator.dupe(u8, "{\"ok\":true}");
             },
             .req_ping => return allocator.dupe(u8, "{\"pong\":true}"),
+            .req_call => {
+                const addr_str = parseKVPayload(payload, "addr") orelse return allocator.dupe(u8, "{\"err\":\"missing addr\"}");
+                const addr = parseHexOrDec(u64, addr_str) catch return allocator.dupe(u8, "{\"err\":\"invalid addr\"}");
+                const args_str = parseKVPayload(payload, "args") orelse "";
+
+                // Write call request
+                const call_req: *volatile shm.CallRequest = @ptrCast(@alignCast(&self.daemon.shm_ptr.engineExtData));
+                call_req.status = 0;
+                call_req.argc = 0;
+                call_req.func_addr = 0;
+                call_req.args = [_]u64{0} ** 6;
+                call_req.result = 0;
+                call_req.status = shm.CALL_PENDING;
+                call_req.func_addr = addr;
+
+                // Parse args
+                var argc: u32 = 0;
+                if (args_str.len > 0) {
+                    var it = std.mem.splitScalar(u8, args_str, ',');
+                    while (it.next()) |part| {
+                        if (argc >= 6) break;
+                        const t = std.mem.trim(u8, part, " []\t\"'");
+                        call_req.args[argc] = parseHexOrDec(u64, t) catch 0;
+                        argc += 1;
+                    }
+                }
+                call_req.argc = argc;
+
+                // Wake the agent by bumping version
+                @atomicStore(u32, &call_req.status, shm.CALL_PENDING, .release);
+                shm.bumpVersion(self.daemon.shm_ptr);
+
+                // Poll for result (timeout ~1 second)
+                var timeout: u32 = 100;
+                while (timeout > 0) : (timeout -= 1) {
+                    const st = @atomicLoad(u32, &call_req.status, .acquire);
+                    if (st == shm.CALL_DONE) {
+                        return std.fmt.allocPrint(allocator, "{{\"ok\":true,\"result\":{d}}}", .{call_req.result});
+                    }
+                    if (st == shm.CALL_ERROR) {
+                        return allocator.dupe(u8, "{\"err\":\"call failed\"}");
+                    }
+                    // 10ms sleep via nanosleep
+                    var req = linux.timespec{ .sec = 0, .nsec = 10_000_000 };
+                    _ = linux.nanosleep(&req, null);
+                }
+                return allocator.dupe(u8, "{\"err\":\"timeout\"}");
+            },
             .req_shutdown => return allocator.dupe(u8, "{\"ok\":true}"),
             else => return allocator.dupe(u8, "{\"err\":\"unknown command\"}"),
         }

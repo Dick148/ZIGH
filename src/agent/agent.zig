@@ -14,6 +14,21 @@ const MODE_READBACK = @as(u32, 1 << 2);
 const STATUS_RUNNING = @as(u32, 1);
 const STATUS_SHUTDOWN = @as(u32, 3);
 
+// ─── Call request (in engineExtData[0..72]) ──────────────────────────────
+
+const CALL_IDLE = @as(u32, 0);
+const CALL_PENDING = @as(u32, 1);
+const CALL_DONE = @as(u32, 2);
+const CALL_ERROR = @as(u32, 3);
+
+const CallRequest = extern struct {
+    status: u32,
+    argc: u32,
+    func_addr: u64,
+    args: [6]u64,
+    result: u64,
+};
+
 const CmdSlot = extern struct {
     mode: u32,
     valueType: u32,
@@ -190,6 +205,30 @@ fn workerLoop() void {
         }
 
         const interval = @atomicLoad(u32, &shm.lockIntervalMs, .acquire);
+
+        // ─── Check for remote call request ────────────────────────────
+        const call_req: *volatile CallRequest = @ptrCast(@alignCast(&shm._ext));
+        if (@atomicLoad(u32, &call_req.status, .acquire) == CALL_PENDING) {
+            const addr = call_req.func_addr;
+            const argc = call_req.argc;
+            if (addr != 0 and argc <= 6) {
+                const Fn = *const fn (u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+                const func: Fn = @ptrFromInt(@as(usize, @intCast(addr)));
+                const result = func(
+                    call_req.args[0],
+                    call_req.args[1],
+                    call_req.args[2],
+                    call_req.args[3],
+                    call_req.args[4],
+                    call_req.args[5],
+                );
+                call_req.result = result;
+                @atomicStore(u32, &call_req.status, CALL_DONE, .release);
+            } else {
+                @atomicStore(u32, &call_req.status, CALL_ERROR, .release);
+            }
+        }
+
         sleepMs(if (interval > 0) interval else 16);
     }
 }

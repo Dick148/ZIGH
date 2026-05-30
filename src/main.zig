@@ -214,7 +214,15 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
             defer alloc.free(resp);
             std.debug.print("{s}\n", .{resp});
         },
-        .call => std.debug.print("call: not yet implemented\n", .{}),
+        .call => {
+            if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh call <addr> [--args 1,2,3]\n", .{}); return; }
+            const args = pa.getOpt("args") orelse "";
+            const payload = try std.fmt.allocPrint(alloc, "{{\"addr\":\"{s}\",\"args\":\"{s}\"}}", .{ pa.positional.items[0], args });
+            defer alloc.free(payload);
+            const resp = try client.send(alloc, .req_call, payload);
+            defer alloc.free(resp);
+            std.debug.print("{s}\n", .{resp});
+        },
         .inject => std.debug.print("inject: handled standalone\n", .{}),
         else => unreachable,
     }

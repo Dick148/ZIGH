@@ -35,6 +35,19 @@ pub const STATUS_RUNNING: u32 = 1;
 pub const STATUS_ERROR: u32 = 2;
 pub const STATUS_SHUTDOWN: u32 = 3;
 
+pub const CALL_IDLE: u32 = 0;
+pub const CALL_PENDING: u32 = 1;
+pub const CALL_DONE: u32 = 2;
+pub const CALL_ERROR: u32 = 3;
+
+pub const CallRequest = extern struct {
+    status: u32 = 0,
+    argc: u32 = 0,
+    func_addr: u64 = 0,
+    args: [6]u64 = [_]u64{0} ** 6,
+    result: u64 = 0,
+};
+
 // ─── Layout structs (packed for wire compatibility) ─────────────────────
 
 pub const CmdSlot = extern struct {
