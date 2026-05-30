@@ -16,6 +16,7 @@ shm_name: [:0]const u8,
 pid: u32,
 engine: u32,
 mem_fd: ?linux.fd_t = null,
+lock_names: [shm.MAX_CMD_SLOTS][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** shm.MAX_CMD_SLOTS,
 
 pub fn init(allocator: std.mem.Allocator, pid: u32, engine: u32) !Daemon {
     var name_buf: [64]u8 = undefined;
@@ -94,6 +95,37 @@ pub fn readBack(self: *Daemon, buf: []ReadResult) usize {
 
 pub const ReadResult = struct { slotId: u32, value: u64, hasError: bool };
 
+// ─── Slot management ────────────────────────────────────────────────────
+
+fn findFreeSlot(self: *Daemon) ?u32 {
+    for (0..shm.MAX_CMD_SLOTS) |i| {
+        if (self.shm_ptr.cmdSlots[i].mode & shm.MODE_ENABLED == 0) return @intCast(i);
+    }
+    return null;
+}
+
+fn findSlotByName(self: *Daemon, name: []const u8) ?u32 {
+    for (0..shm.MAX_CMD_SLOTS) |i| {
+        if (self.shm_ptr.cmdSlots[i].mode & shm.MODE_ENABLED != 0) {
+            const n = std.mem.sliceTo(&self.lock_names[i], 0);
+            if (std.mem.eql(u8, n, name)) return @intCast(i);
+        }
+    }
+    return null;
+}
+
+fn clearSlot(self: *Daemon, index: u32) void {
+    self.shm_ptr.cmdSlots[index].mode = 0;
+    @memset(&self.lock_names[index], 0);
+    // Re-count active slots
+    var count: u32 = 0;
+    for (0..shm.MAX_CMD_SLOTS) |i| {
+        if (self.shm_ptr.cmdSlots[i].mode & shm.MODE_ENABLED != 0) count += 1;
+    }
+    self.shm_ptr.cmdCount = count;
+    shm.bumpVersion(self.shm_ptr);
+}
+
 // ─── Socket handler ─────────────────────────────────────────────────────
 
 pub const Handler = struct {
@@ -103,20 +135,54 @@ pub const Handler = struct {
         switch (msg_type) {
             .req_status => return makeStatus(self.daemon, allocator),
             .req_lock_add => {
-                if (parseKVPayload(payload, "name")) |name| {
-                    if (parseKVPayload(payload, "value")) |val_str| {
-                        const val = std.fmt.parseUnsigned(u64, val_str, 10) catch 0;
-                        const tid = if (parseKVPayload(payload, "type")) |t| types.TypeId.fromString(t) orelse .uint32 else .uint32;
-                        const addr_str = parseKVPayload(payload, "address") orelse "0";
-                        const rva = parseAddressRva(addr_str) catch 0;
-                        _ = name; _ = val; _ = tid; _ = rva;
-                        // TODO: actually add lock slot
-                        return allocator.dupe(u8, "{\"ok\":true}");
+                const name = parseKVPayload(payload, "name") orelse return allocator.dupe(u8, "{\"err\":\"missing name\"}");
+                const val_str = parseKVPayload(payload, "value") orelse return allocator.dupe(u8, "{\"err\":\"missing value\"}");
+                const val = std.fmt.parseUnsigned(u64, val_str, 10) catch 0;
+                const tid_str = parseKVPayload(payload, "type") orelse "u32";
+                const tid = types.TypeId.fromString(tid_str) orelse .uint32;
+                const addr_str = parseKVPayload(payload, "address") orelse "0";
+                const rva = parseAddressRva(addr_str) catch 0;
+                const base = self.daemon.shm_ptr.initParams.targetModuleBase;
+                const chain_str = parseKVPayload(payload, "chain");
+
+                // Find free slot or reuse existing by name
+                const slot_idx = self.daemon.findSlotByName(name) orelse self.daemon.findFreeSlot() orelse
+                    return allocator.dupe(u8, "{\"err\":\"no free slots\"}");
+
+                // Parse chain
+                var chain_buf: [8]u32 = [_]u32{0} ** 8;
+                var chain_len: u32 = 0;
+                if (chain_str) |cs| {
+                    var it = std.mem.splitScalar(u8, cs, ',');
+                    while (it.next()) |part| {
+                        if (chain_len >= 8) break;
+                        const t = std.mem.trim(u8, part, " []\t");
+                        chain_buf[chain_len] = parseHexOrDec(u32, t) catch 0;
+                        chain_len += 1;
                     }
                 }
-                return allocator.dupe(u8, "{\"err\":\"missing args\"}");
+
+                self.daemon.setSlot(slot_idx, shm.MODE_ENABLED | shm.MODE_LOCK | shm.MODE_READBACK, tid, val, rva, base, chain_buf[0..chain_len], chain_len) catch {};
+                // Store name
+                @memcpy(self.daemon.lock_names[slot_idx][0..@min(name.len, 31)], name[0..@min(name.len, 31)]);
+                // Re-count active
+                var active: u32 = 0;
+                for (0..shm.MAX_CMD_SLOTS) |j| {
+                    if (self.daemon.shm_ptr.cmdSlots[j].mode & shm.MODE_ENABLED != 0) active += 1;
+                }
+                self.daemon.shm_ptr.cmdCount = active;
+                shm.bumpVersion(self.daemon.shm_ptr);
+
+                return std.fmt.allocPrint(allocator, "{{\"ok\":true,\"slot\":{d}}}", .{slot_idx});
             },
-            .req_lock_remove => return allocator.dupe(u8, "{\"ok\":true}"),
+            .req_lock_remove => {
+                const name = parseKVPayload(payload, "name") orelse return allocator.dupe(u8, "{\"err\":\"missing name\"}");
+                if (self.daemon.findSlotByName(name)) |idx| {
+                    self.daemon.clearSlot(idx);
+                    return allocator.dupe(u8, "{\"ok\":true}");
+                }
+                return allocator.dupe(u8, "{\"err\":\"not found\"}");
+            },
             .req_lock_list => return makeStatus(self.daemon, allocator),
             .req_write => {
                 if (parseKVPayload(payload, "addr")) |addr_str| {
@@ -145,19 +211,22 @@ pub const Handler = struct {
 };
 
 fn makeStatus(d: *Daemon, a: std.mem.Allocator) ![]u8 {
-    var results: [64]ReadResult = undefined;
-    const count = d.readBack(&results);
     var json: std.ArrayList(u8) = .empty;
     try json.appendSlice(a, "{\"pid\":");
     var pid_buf: [16]u8 = undefined;
     const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{d.pid});
     try json.appendSlice(a, pid_str);
     try json.appendSlice(a, ",\"locks\":[");
-    for (results[0..count], 0..) |r, i| {
-        if (i > 0) try json.append(a, ',');
-        var val_buf: [32]u8 = undefined;
-        const val_str = try std.fmt.bufPrint(&val_buf, "{{\"slot\":{d},\"value\":{d}}}", .{ r.slotId, r.value });
-        try json.appendSlice(a, val_str);
+    var written: usize = 0;
+    for (0..shm.MAX_CMD_SLOTS) |i| {
+        if (d.shm_ptr.cmdSlots[i].mode & shm.MODE_ENABLED != 0) {
+            if (written > 0) try json.append(a, ',');
+            const name = std.mem.sliceTo(&d.lock_names[i], 0);
+            var val_buf: [64]u8 = undefined;
+            const val_str = try std.fmt.bufPrint(&val_buf, "{{\"slot\":{d},\"name\":\"{s}\"}}", .{ i, name });
+            try json.appendSlice(a, val_str);
+            written += 1;
+        }
     }
     try json.appendSlice(a, "]}");
     return json.toOwnedSlice(a);
