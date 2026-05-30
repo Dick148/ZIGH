@@ -83,7 +83,7 @@ pub fn create(name: [:0]const u8) !*align(4096) SharedMemory {
     if (fd == -1) return error.ShmOpenFailed;
     _ = c.ftruncate(fd, SHM_SIZE);
     const slice = try posix.mmap(null, SHM_SIZE, posix.PROT{ .READ = true, .WRITE = true }, posix.MAP{ .TYPE = .SHARED }, @intCast(fd), 0);
-    posix.close(@intCast(fd));
+    _ = std.c.close(@intCast(fd));
     const ptr: *align(4096) SharedMemory = @ptrCast(@alignCast(slice.ptr));
     @memset(@as([*]u8, @ptrCast(ptr))[0..SHM_SIZE], 0);
     return ptr;
@@ -94,7 +94,7 @@ pub fn open(name: [:0]const u8) !*align(4096) SharedMemory {
     const fd = c.shm_open(name, @bitCast(posix.O{ .ACCMODE = .RDWR }), 0);
     if (fd == -1) return error.ShmOpenFailed;
     const slice = try posix.mmap(null, SHM_SIZE, posix.PROT{ .READ = true, .WRITE = true }, posix.MAP{ .TYPE = .SHARED }, @intCast(fd), 0);
-    posix.close(@intCast(fd));
+    _ = std.c.close(@intCast(fd));
     return @ptrCast(@alignCast(slice.ptr));
 }
 

@@ -64,7 +64,7 @@ pub const ParsedArgs = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ParsedArgs) void {
-        self.positional.deinit();
+        self.positional.deinit(self.allocator);
         self.opts.deinit();
     }
 

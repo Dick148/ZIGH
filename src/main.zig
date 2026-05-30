@@ -164,12 +164,12 @@ fn cmdWrite(pa: *const cli.ParsedArgs) !void {
 
     const d = try getDaemon();
     const value: u64 = switch (tid) {
-        .float32, .float64 => {
+        .float32, .float64 => blk: {
             const f = std.fmt.parseFloat(f64, val_str) catch {
                 std.debug.print("Invalid float: {s}\n", .{val_str});
                 return;
             };
-            @as(u64, @bitCast(@as(f64, f)));
+            break :blk @as(u64, @bitCast(@as(f64, f)));
         },
         else => parseHexOrDec(u64, val_str) catch {
             std.debug.print("Invalid value: {s}\n", .{val_str});
