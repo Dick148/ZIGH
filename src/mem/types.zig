@@ -31,6 +31,20 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn fromString(s: []const u8) ?TypeId {
+        // Short aliases
+        if (std.mem.eql(u8, s, "u8")) return .uint8;
+        if (std.mem.eql(u8, s, "u16")) return .uint16;
+        if (std.mem.eql(u8, s, "u32")) return .uint32;
+        if (std.mem.eql(u8, s, "u64")) return .uint64;
+        if (std.mem.eql(u8, s, "i8")) return .int8;
+        if (std.mem.eql(u8, s, "i16")) return .int16;
+        if (std.mem.eql(u8, s, "i32")) return .int32;
+        if (std.mem.eql(u8, s, "i64")) return .int64;
+        if (std.mem.eql(u8, s, "f32")) return .float32;
+        if (std.mem.eql(u8, s, "f64")) return .float64;
+        if (std.mem.eql(u8, s, "ptr")) return .pointer;
+        if (std.mem.eql(u8, s, "bytes")) return .bytes8;
+        // Full names
         for (std.meta.tags(TypeId)) |tag| {
             if (std.mem.eql(u8, s, @tagName(tag))) return tag;
         }

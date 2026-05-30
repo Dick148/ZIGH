@@ -6,9 +6,13 @@ const cli = @import("cli/parser.zig");
 const types = @import("mem/types.zig");
 const mem = @import("mem/mod.zig");
 const daemon_mod = @import("engine/daemon.zig");
+const cheat = @import("cheat/mod.zig");
+const shm_mod = @import("ipc/shm.zig");
 
 var gpa_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const alloc = gpa_instance.allocator();
+
+var loaded_cheat: ?cheat.CheatFile = null;
 
 pub fn main(init: std.process.Init) !void {
     defer gpa_instance.deinit();
@@ -206,21 +210,49 @@ fn cmdRead(pa: *const cli.ParsedArgs) !void {
 }
 
 fn cmdCheatLoad(pa: *const cli.ParsedArgs) !void {
-    if (pa.positional.items.len < 1) {
-        std.debug.print("Usage: zigh cheat-load <file.yaml>\n", .{});
+    if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh cheat-load <file.yaml>\n", .{}); return; }
+    const path = pa.positional.items[0];
+    const cf = cheat.loadFile(alloc, path) catch |err| {
+        std.debug.print("Failed to load: {}\n", .{err});
         return;
+    };
+    std.debug.print("Loaded: {s} ({s})\n", .{ cf.game, cf.process });
+    std.debug.print("  Locks: {d}\n", .{cf.locks.len});
+    for (cf.locks) |l| {
+        std.debug.print("    {s}: {s} type={s} default=0x{x}\n", .{ l.name, l.address, @tagName(l.type), l.default });
     }
-    std.debug.print("[cheat-load] '{s}' — YAML parser not yet implemented\n", .{pa.positional.items[0]});
+    if (cf.remote_calls.len > 0) std.debug.print("  Calls: {d}\n", .{cf.remote_calls.len});
+    if (loaded_cheat) |*old| old.deinit(alloc);
+    loaded_cheat = cf;
 }
 
 fn cmdCheatStart(pa: *const cli.ParsedArgs) !void {
     _ = pa;
-    std.debug.print("[cheat-start] Not yet implemented.\n", .{});
+    const cf = loaded_cheat orelse { std.debug.print("No cheat loaded.\n", .{}); return; };
+    const d = try getDaemon();
+    for (cf.locks, 0..) |lock, i| {
+        const mode = shm_mod.MODE_ENABLED | shm_mod.MODE_LOCK | shm_mod.MODE_READBACK;
+        const base = d.shm_ptr.initParams.targetModuleBase;
+        const rva = try parseAddressRva(lock.address);
+        try d.setSlot(@intCast(i), mode, lock.type, lock.default, rva, base, lock.chain, @intCast(lock.chain.len));
+    }
+    d.shm_ptr.cmdCount = @intCast(cf.locks.len);
+    shm_mod.bumpVersion(d.shm_ptr);
+    std.debug.print("Activated {d} locks.\n", .{cf.locks.len});
 }
 
 fn cmdCheatStop(pa: *const cli.ParsedArgs) !void {
     _ = pa;
-    std.debug.print("[cheat-stop] Not yet implemented.\n", .{});
+    const d = try getDaemon();
+    for (0..shm_mod.MAX_CMD_SLOTS) |i| d.shm_ptr.cmdSlots[i].mode = 0;
+    d.shm_ptr.cmdCount = 0;
+    shm_mod.bumpVersion(d.shm_ptr);
+    std.debug.print("All locks released.\n", .{});
+}
+
+fn parseAddressRva(addr: []const u8) !u64 {
+    if (std.mem.indexOfScalar(u8, addr, '+')) |plus| return parseHexOrDec(u64, addr[plus + 1 ..]);
+    return parseHexOrDec(u64, addr);
 }
 
 // ─── Utilities ──────────────────────────────────────────────────────────

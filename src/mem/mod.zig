@@ -113,7 +113,7 @@ pub fn findPid(name: []const u8) !?u32 {
         const n = linux.read(@intCast(raw), &comm_buf, comm_buf.len);
         _ = std.c.close(@intCast(raw));
         if (n > 0) {
-            const trimmed = std.mem.trimRight(u8, comm_buf[0..@intCast(n)], "\n");
+            const trimmed = std.mem.trimEnd(u8, comm_buf[0..@intCast(n)], "\n");
             if (std.mem.eql(u8, trimmed, name)) return pid;
         }
     }
