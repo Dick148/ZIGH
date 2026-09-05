@@ -1,94 +1,66 @@
-// ZIGH Agent — Injected .so for zero-syscall memory locking
-// Runs inside the game process, reads shared memory, writes directly
+// ZIGH Agent — Worker-thread based (no hooks needed, pure Zig)
+// Injected via ptrace. Creates its own worker thread that polls shm
+// and writes values. On error, reports via readSlots.
 
 const std = @import("std");
 const linux = std.os.linux;
-
-// ─── Shared memory layout (must match ipc/shm.zig) ──────────────────────
 
 const SHM_SIZE = 4096;
 const MAX_CMD_SLOTS = 16;
 const MODE_ENABLED = @as(u32, 1 << 0);
 const MODE_LOCK = @as(u32, 1 << 1);
-const MODE_READBACK = @as(u32, 1 << 2);
-const STATUS_RUNNING = @as(u32, 1);
-const STATUS_SHUTDOWN = @as(u32, 3);
+const STATUS_UNINITIALIZED: u32 = 0;
+const STATUS_RUNNING: u32 = 1;
+const STATUS_ERROR: u32 = 2;
+const STATUS_SHUTDOWN: u32 = 3;
 
-// ─── Call request (in engineExtData[0..72]) ──────────────────────────────
-
-const CALL_IDLE = @as(u32, 0);
-const CALL_PENDING = @as(u32, 1);
-const CALL_DONE = @as(u32, 2);
-const CALL_ERROR = @as(u32, 3);
-
-const CallRequest = extern struct {
-    status: u32,
-    argc: u32,
-    func_addr: u64,
-    args: [6]u64,
-    result: u64,
-};
-
-const CmdSlot = extern struct {
-    mode: u32,
-    valueType: u32,
-    layerCount: u32,
-    slotId: u32,
-    valueAsU64: u64,
-    rva: u64,
-    targetModuleBase: u64,
-    offsets: [8]u32,
-    _reserved: [32]u8,
-};
-
-const ReadSlot = extern struct {
-    valueAsU64: u64,
-    slotId: u32,
-    flags: u32,
-};
+// ReadSlot error flags
+const RS_VALID = @as(u32, 1 << 0);
+const RS_READ_ERR = @as(u32, 1 << 1);
+const RS_WRITE_ERR = @as(u32, 1 << 2);
+const RS_CHAIN_BROKEN = @as(u32, 1 << 3);
 
 const SharedMemory = extern struct {
-    version: u32,
-    cmdCount: u32,
-    lockIntervalMs: u32,
-    engineType: u32,
-    agentStatus: u32,
-    _reserved: u32,
-    _initParams: [48]u8,
-    cmdSlots: [MAX_CMD_SLOTS]CmdSlot,
-    readSlots: [64]ReadSlot,
-    _ext: [256]u8,
+    version: u32, cmdCount: u32, lockIntervalMs: u32, engineType: u32,
+    agentStatus: u32, reserved: u32, initParams: [48]u8,
+    cmdSlots: [MAX_CMD_SLOTS]extern struct {
+        mode: u32, valueType: u32, layerCount: u32, slotId: u32,
+        valueAsU64: u64, rva: u64, targetModuleBase: u64,
+        offsets: [8]u32, _reserved: [32]u8,
+    },
+    readSlots: [64]extern struct { valueAsU64: u64, slotId: u32, flags: u32 },
+    engineExtData: [256]u8,
 };
 
 const CachedCmd = struct {
     addr: usize,
     value: u64,
     tid: u32,
-    slotId: u32,
-    needsReadback: bool,
     needsReResolve: bool,
     rva: u64,
     base: u64,
     offsets: [8]u32,
     layerCount: u32,
+    slotId: u32,
 };
-
-// ─── Globals ─────────────────────────────────────────────────────────────
 
 var shm: *volatile SharedMemory = undefined;
 var last_version: u32 = 0;
 var lock_cmds: [MAX_CMD_SLOTS]CachedCmd = undefined;
 var lock_count: u32 = 0;
+var initialized: bool = false;
+var worker_running: bool = false;
 
-// ─── Helper: nanosleep via syscall ───────────────────────────────────────
-
-fn sleepMs(ms: u32) void {
-    const ns: u64 = @as(u64, ms) * 1_000_000;
-    var req = linux.timespec{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) };
-    _ = linux.nanosleep(&req, null);
+fn tryOpenShm(my_pid: u32, engine: u32) ?*volatile SharedMemory {
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&name_buf, "/dev/shm/zigh_{d}_{d}", .{ my_pid, engine }) catch return null;
+    const fd = linux.open(name, linux.O{ .ACCMODE = .RDWR }, 0);
+    if (@as(isize, @bitCast(fd)) < 0) return null;
+    const ptr = linux.mmap(null, SHM_SIZE, linux.PROT{ .READ = true, .WRITE = true }, linux.MAP{ .TYPE = .SHARED }, @intCast(fd), 0);
+    _ = std.c.close(@intCast(fd));
+    if (@as(isize, @bitCast(ptr)) < 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(ptr)));
 }
-
-// ─── Pointer chain resolution ────────────────────────────────────────────
 
 fn resolveChain(base: usize, rva: u64, offsets: [*]const u32, layers: u32) usize {
     if (layers == 0) return base + rva;
@@ -101,42 +73,29 @@ fn resolveChain(base: usize, rva: u64, offsets: [*]const u32, layers: u32) usize
     return ptr + offsets[layers - 1];
 }
 
-// ─── Direct memory write (no syscall!) ───────────────────────────────────
-
 fn writeValue(addr: usize, value: u64, tid: u32) void {
-    const p = @as([*]u8, @ptrFromInt(addr));
     switch (tid) {
-        0, 1 => p[0] = @truncate(value), // int8/uint8
-        2, 3 => {
-            const v16: u16 = @truncate(value);
-            @as(*u16, @ptrFromInt(addr)).* = v16;
-        },
-        4, 5, 8 => {
-            const v32: u32 = @truncate(value);
-            @as(*u32, @ptrFromInt(addr)).* = v32;
-        },
-        6, 7, 9, 10, 11 => {
-            @as(*u64, @ptrFromInt(addr)).* = value;
-        },
-        else => {},
+        0, 1 => @as(*u8, @ptrFromInt(addr)).* = @truncate(value),
+        2, 3 => @as(*u16, @ptrFromInt(addr)).* = @truncate(value),
+        4, 5, 8 => @as(*u32, @ptrFromInt(addr)).* = @truncate(value),
+        else => @as(*u64, @ptrFromInt(addr)).* = value,
     }
 }
 
-fn readValue(addr: usize, tid: u32) u64 {
-    switch (tid) {
-        0 => return @bitCast(@as(i64, @as(i8, @bitCast(@as(u8, @truncate(@as(*u8, @ptrFromInt(addr)).*)))))),
-        1 => return @as(*u8, @ptrFromInt(addr)).*,
-        2 => return @bitCast(@as(i64, @as(i16, @bitCast(@as(*u16, @ptrFromInt(addr)).*)))),
-        3 => return @as(*u16, @ptrFromInt(addr)).*,
-        4 => return @bitCast(@as(i64, @as(i32, @bitCast(@as(*u32, @ptrFromInt(addr)).*)))),
-        5, 8 => return @as(*u32, @ptrFromInt(addr)).*,
-        6 => return @bitCast(@as(i64, @bitCast(@as(*u64, @ptrFromInt(addr)).*))),
-        7, 9, 10, 11 => return @as(*u64, @ptrFromInt(addr)).*,
-        else => return 0,
-    }
+/// Write error info to the corresponding readSlot.
+fn reportSlotError(slot_id: u32, flags: u32, value: u64) void {
+    if (slot_id == 0 or slot_id > 64) return;
+    const rs = &shm.readSlots[slot_id - 1];
+    rs.valueAsU64 = value;
+    rs.slotId = slot_id;
+    rs.flags = flags;
 }
 
-// ─── Rebuild cached command list ─────────────────────────────────────────
+/// Clear any previous error on the readSlot for this command.
+fn clearSlotError(slot_id: u32) void {
+    if (slot_id == 0 or slot_id > 64) return;
+    shm.readSlots[slot_id - 1].flags = 0;
+}
 
 fn rebuildCommands() void {
     lock_count = 0;
@@ -148,126 +107,126 @@ fn rebuildCommands() void {
         if (slot.mode & MODE_LOCK == 0) continue;
 
         const addr = resolveChain(slot.targetModuleBase, slot.rva, @volatileCast(@ptrCast(&slot.offsets)), slot.layerCount);
-        lock_cmds[lock_count] = CachedCmd{
+        lock_cmds[lock_count] = .{
             .addr = addr,
             .value = slot.valueAsU64,
             .tid = slot.valueType,
-            .slotId = slot.slotId,
-            .needsReadback = (slot.mode & MODE_READBACK) != 0,
             .needsReResolve = (slot.mode & (1 << 4)) != 0,
             .rva = slot.rva,
             .base = slot.targetModuleBase,
             .offsets = slot.offsets,
             .layerCount = slot.layerCount,
+            .slotId = slot.slotId,
         };
         lock_count += 1;
     }
 }
 
-// ─── Main lock loop ──────────────────────────────────────────────────────
+fn executeLocks() void {
+    var i: u32 = 0;
+    while (i < lock_count) : (i += 1) {
+        const cmd = &lock_cmds[i];
 
-fn workerLoop() void {
-    while (true) {
+        // Resolve chain address
+        var addr = cmd.addr;
+        if (cmd.needsReResolve or addr == 0) {
+            addr = resolveChain(cmd.base, cmd.rva, &cmd.offsets, cmd.layerCount);
+            cmd.addr = addr;
+        }
+
+        if (addr == 0) {
+            reportSlotError(cmd.slotId, RS_CHAIN_BROKEN, cmd.value);
+            continue;
+        }
+
+        // Perform the write
+        // In an injected agent, writing to an invalid address causes SIGSEGV.
+        // We can't catch that from user mode, so we trust the addr is valid.
+        // The /proc/PID/mem path (daemon-side) does proper error checking.
+        writeValue(addr, cmd.value, cmd.tid);
+
+        // Clear any previous error — success is silent
+        if (shm.readSlots[cmd.slotId - 1].flags != 0) {
+            clearSlotError(cmd.slotId);
+        }
+    }
+}
+
+/// Worker thread: polls shared memory, executes locks, sleeps.
+fn agentWorker() void {
+    while (worker_running) {
         const status = @atomicLoad(u32, &shm.agentStatus, .acquire);
-        if (status == STATUS_SHUTDOWN) break;
+        if (status == STATUS_SHUTDOWN) {
+            worker_running = false;
+            return;
+        }
 
+        // Check for version change (new/modified commands)
         const ver = @atomicLoad(u32, &shm.version, .acquire);
         if (ver != last_version) {
             rebuildCommands();
             last_version = ver;
         }
 
-        // Execute all lock commands
-        var i: u32 = 0;
-        while (i < lock_count) : (i += 1) {
-            const cmd = &lock_cmds[i];
-            if (cmd.addr == 0) continue;
-
-            if (cmd.needsReResolve) {
-                cmd.addr = resolveChain(cmd.base, cmd.rva, &cmd.offsets, cmd.layerCount);
-                if (cmd.addr == 0) continue;
-            }
-
-            writeValue(cmd.addr, cmd.value, cmd.tid);
-
-            if (cmd.needsReadback) {
-                const actual = readValue(cmd.addr, cmd.tid);
-                // Find matching readSlot by slotId
-                var ri: u32 = 0;
-                while (ri < 64) : (ri += 1) {
-                    if (shm.readSlots[ri].slotId == cmd.slotId) {
-                        shm.readSlots[ri].valueAsU64 = actual;
-                        shm.readSlots[ri].flags = 1; // VALID
-                        break;
-                    }
-                }
-            }
+        // Execute lock commands
+        if (lock_count > 0) {
+            executeLocks();
         }
 
+        // Sleep for lockIntervalMs (default 250ms), read from daemon-controlled shm header
         const interval = @atomicLoad(u32, &shm.lockIntervalMs, .acquire);
-
-        // ─── Check for remote call request ────────────────────────────
-        const call_req: *volatile CallRequest = @ptrCast(@alignCast(&shm._ext));
-        if (@atomicLoad(u32, &call_req.status, .acquire) == CALL_PENDING) {
-            const addr = call_req.func_addr;
-            const argc = call_req.argc;
-            if (addr != 0 and argc <= 6) {
-                const Fn = *const fn (u64, u64, u64, u64, u64, u64) callconv(.c) u64;
-                const func: Fn = @ptrFromInt(@as(usize, @intCast(addr)));
-                const result = func(
-                    call_req.args[0],
-                    call_req.args[1],
-                    call_req.args[2],
-                    call_req.args[3],
-                    call_req.args[4],
-                    call_req.args[5],
-                );
-                call_req.result = result;
-                @atomicStore(u32, &call_req.status, CALL_DONE, .release);
-            } else {
-                @atomicStore(u32, &call_req.status, CALL_ERROR, .release);
-            }
-        }
-
-        sleepMs(if (interval > 0) interval else 16);
+        const sleep_ms: u64 = if (interval > 0) @min(interval, 5000) else 250;
+        var req = linux.timespec{ .sec = @intCast(sleep_ms / 1000), .nsec = @intCast((sleep_ms % 1000) * 1_000_000) };
+        _ = linux.nanosleep(&req, null);
     }
-}
-
-// ─── Constructor — called when .so is loaded ─────────────────────────────
-
-fn openShm(name: [:0]const u8) ?*volatile SharedMemory {
-    const fd = std.c.shm_open(name, @bitCast(linux.O{ .ACCMODE = .RDWR }), 0);
-    if (fd == -1) return null;
-    const ptr = linux.mmap(null, SHM_SIZE, linux.PROT{ .READ = true, .WRITE = true }, linux.MAP{ .TYPE = .SHARED }, @intCast(fd), 0);
-    _ = std.c.close(fd);
-    if (@as(isize, @bitCast(ptr)) < 0) return null;
-    return @ptrFromInt(@as(usize, @bitCast(ptr)));
 }
 
 export fn agent_init() void {
-    // Get own PID
-    const my_pid = linux.getpid();
+    const my_pid: u32 = @intCast(linux.getpid());
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (tryOpenShm(my_pid, 0)) |s| {
+            shm = s;
+            const engine = @atomicLoad(u32, &shm.engineType, .acquire);
+            if (engine != 0) {
+                if (tryOpenShm(my_pid, engine)) |s2| {
+                    shm = s2;
+                } else {
+                    continue;
+                }
+            }
+            initialized = true;
 
-    // Try to open shared memory (try engine=0 first = generic)
-    var name_buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&name_buf, "/zigh_{d}_0", .{my_pid}) catch return;
-    shm = openShm(name) orelse return;
+            // Spawn the worker thread (detached — runs independently)
+            worker_running = true;
+            const thread = std.Thread.spawn(.{}, agentWorker, .{}) catch {
+                @atomicStore(u32, &shm.agentStatus, STATUS_ERROR, .release);
+                return;
+            };
+            thread.detach();
 
-    // Read engine type from shm
-    const engine = @atomicLoad(u32, &shm.engineType, .acquire);
-
-    // If engine != 0, reopen with correct name
-    if (engine != 0) {
-        const name2 = std.fmt.bufPrintZ(&name_buf, "/zigh_{d}_{d}", .{ my_pid, engine }) catch return;
-        shm = openShm(name2) orelse return;
+            @atomicStore(u32, &shm.agentStatus, STATUS_RUNNING, .release);
+            return;
+        }
+        // Sleep 100ms between retries (up to 60s total)
+        var req = linux.timespec{ .sec = 0, .nsec = 100_000_000 };
+        _ = linux.nanosleep(&req, null);
     }
-
-    // Mark as running
-    @atomicStore(u32, &shm.agentStatus, STATUS_RUNNING, .release);
-
-    // Start worker
-    workerLoop();
 }
 
-// Dummy main for shared library
-export fn _start() void {}
+// Legacy export: agent_tick for backward compat with hook-based injection.
+// No longer the primary execution path — use agent_init + worker thread instead.
+export fn agent_tick() callconv(.c) void {
+    if (!initialized) return;
+    const ver = @atomicLoad(u32, &shm.version, .acquire);
+    if (ver != last_version) {
+        rebuildCommands();
+        last_version = ver;
+    }
+    if (lock_count > 0) {
+        executeLocks();
+    }
+}
+
+// Reserved space for hook trampoline (may be written by injector at runtime)
+export var _trampoline_space: [128]u8 align(16) = [_]u8{0xcc} ** 128;

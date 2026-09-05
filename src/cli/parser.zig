@@ -11,6 +11,8 @@ pub const Command = enum {
     @"lock-add",
     @"lock-remove",
     @"lock-list",
+    @"chain-lock",
+    @"chain-unlock",
     write,
     read,
     call,
@@ -18,6 +20,7 @@ pub const Command = enum {
     @"cheat-start",
     @"cheat-stop",
     inject,
+    scan,
 
     pub fn parse(name: []const u8) ?Command {
         if (std.mem.eql(u8, name, "help")) return .help;
@@ -27,6 +30,8 @@ pub const Command = enum {
         if (std.mem.eql(u8, name, "lock-add")) return .@"lock-add";
         if (std.mem.eql(u8, name, "lock-remove")) return .@"lock-remove";
         if (std.mem.eql(u8, name, "lock-list")) return .@"lock-list";
+        if (std.mem.eql(u8, name, "chain-lock")) return .@"chain-lock";
+        if (std.mem.eql(u8, name, "chain-unlock")) return .@"chain-unlock";
         if (std.mem.eql(u8, name, "write")) return .write;
         if (std.mem.eql(u8, name, "read")) return .read;
         if (std.mem.eql(u8, name, "call")) return .call;
@@ -34,6 +39,7 @@ pub const Command = enum {
         if (std.mem.eql(u8, name, "cheat-start")) return .@"cheat-start";
         if (std.mem.eql(u8, name, "cheat-stop")) return .@"cheat-stop";
         if (std.mem.eql(u8, name, "inject")) return .inject;
+        if (std.mem.eql(u8, name, "scan")) return .scan;
         return null;
     }
 
@@ -41,18 +47,21 @@ pub const Command = enum {
         return switch (self) {
             .help => "zigh help                         — Show this help",
             .version => "zigh version                      — Show version info",
-            .daemon => "zigh daemon [--pid <id>]          — Start daemon for a game process",
+            .daemon => "zigh daemon --pid <id> [--inject] [--so <agent.so>]  — Start daemon for a game process",
             .status => "zigh status                       — Show active locks & daemon status",
             .@"lock-add" => "zigh lock-add <name> <value> [--type <t>]  — Add a memory lock",
             .@"lock-remove" => "zigh lock-remove <name>            — Remove a memory lock",
             .@"lock-list" => "zigh lock-list                     — List all active locks",
-            .write => "zigh write <addr> <value> [--type <t>]    — One-shot memory write",
+            .@"chain-lock" => "zigh chain-lock <name> <value> --addr <rva> --chain <offsets> [--base <0x...>] [--interval <ms>] — Periodic chain lock",
+            .@"chain-unlock" => "zigh chain-unlock <name>           — Remove a chain lock",
+            .write => "zigh write <addr> <value> [--type <t>] [--chain <offsets>] [--base <0x...>] — Write value",
             .read => "zigh read <addr> [--type <t>]            — One-shot memory read",
             .call => "zigh call <func> [args...]         — Remote function call",
             .@"cheat-load" => "zigh cheat-load <file.yaml>        — Load a cheat definition",
             .@"cheat-start" => "zigh cheat-start [<name>]          — Activate cheats",
             .@"cheat-stop" => "zigh cheat-stop                    — Deactivate all cheats",
             .inject => "zigh inject <pid> <agent.so>       — Inject agent into process",
+            .scan => "zigh scan [--pid <id>] [--value <n>] [--type <t>] [--option <opt>] [--max-memory <MB>] — Memory scanner",
         };
     }
 };
@@ -128,19 +137,20 @@ pub fn printHelp() void {
         .write, .read, .call,
         .@"cheat-load", .@"cheat-start", .@"cheat-stop",
         .inject,
+        .scan,
     };
     for (cmds) |cmd| {
         std.debug.print("  {s}\n", .{cmd.usage()});
     }
     std.debug.print(
-        \\
-        \\TYPE OPTIONS (for --type flag):
-        \\  u8 u16 u32 u64  i8 i16 i32 i64  f32 f64  ptr bytes
-        \\
-        \\EXAMPLES:
-        \\  zigh daemon --pid 12345
-        \\  zigh lock-add hp 100 --type f32
-        \\  zigh cheat-load ~/.config/zigh/cheats/nier.yaml
-        \\
+        \\\
+        \\\TYPE OPTIONS (for --type flag):
+        \\\  u8 u16 u32 u64  i8 i16 i32 i64  f32 f64  ptr bytes
+        \\\
+        \\\EXAMPLES:
+        \\\  zigh daemon --pid 12345 --inject
+        \\\  zigh lock-add hp 100 --type f32
+        \\\  zigh cheat-load ~/.config/zigh/cheats/nier.yaml
+        \\\
     , .{});
 }

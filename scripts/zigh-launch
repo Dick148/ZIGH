@@ -1,0 +1,54 @@
+#!/bin/bash
+# LD_PRELOAD launcher: starts game with agent.so injected at launch time.
+# Solves the chicken-and-egg: daemon needs PID, agent needs shm.
+#
+# Usage: zigh-launch <game-command>
+# Example: zigh-launch env WINEPREFIX=~/.wine-jp wine GAME_SYS.EXE
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ZIGH="${SCRIPT_DIR}/../zig-out/bin/zigh"
+AGENT="${SCRIPT_DIR}/../zig-out/lib/libzigh_agent.so"
+
+# Start the game in background with LD_PRELOAD
+echo "[launch] Starting: $*"
+LD_PRELOAD="$AGENT" "$@" &
+GAME_PID=$!
+echo "[launch] Game PID: $GAME_PID"
+
+# Give it a moment to load
+sleep 0.5
+
+# Check it's alive
+if ! kill -0 $GAME_PID 2>/dev/null; then
+    echo "[launch] Game exited immediately"
+    exit 1
+fi
+
+# Start daemon for this PID (creates shared memory)
+echo "[launch] Starting daemon for PID $GAME_PID..."
+$ZIGH daemon --pid $GAME_PID &
+DAEMON_PID=$!
+sleep 0.3
+
+# Agent should discover shm now — check after a moment
+sleep 1
+python3 -c "
+import struct, os
+path = f'/dev/shm/zigh_{$GAME_PID}_0'
+if os.path.exists(path):
+    fd = os.open(path, os.O_RDONLY)
+    d = os.read(fd, 64)
+    os.close(fd)
+    status = struct.unpack_from('<I', d, 16)[0]
+    print(f'Agent status: {status} (1=RUNNING)')
+    if status == 1:
+        print('LD_PRELOAD injection SUCCESS — agent is running!')
+    else:
+        print('Agent loaded but not started (status={}). It needs shared memory before init.'.format(status))
+else:
+    print('Shared memory not created — daemon may have failed')
+"
+
+echo "[launch] Daemon PID: $DAEMON_PID"
+echo "[launch] Game PID: $GAME_PID"
+echo "[launch] Game running in background. Use 'zigh status' to check locks."

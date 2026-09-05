@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const types = @import("../mem/types.zig");
+const util = @import("../util.zig");
 
 pub const LockDef = struct {
     name: []const u8 = "",
@@ -173,7 +174,7 @@ fn fillLock(a: std.mem.Allocator, lock: *LockDef, key: []const u8, value: []cons
     if (std.mem.eql(u8, key, "name")) lock.name = a.dupe(u8, value) catch value;
     if (std.mem.eql(u8, key, "address")) lock.address = a.dupe(u8, value) catch value;
     if (std.mem.eql(u8, key, "type")) { if (types.TypeId.fromString(value)) |t| lock.type = t; }
-    if (std.mem.eql(u8, key, "default")) lock.default = parseHexOrDec(u64, value) catch 0;
+    if (std.mem.eql(u8, key, "default")) lock.default = util.parseHexOrDec(u64, value) catch 0;
 }
 
 fn fillCall(a: std.mem.Allocator, call: *RemoteCallDef, key: []const u8, value: []const u8) void {
@@ -190,10 +191,4 @@ fn fillCall(a: std.mem.Allocator, call: *RemoteCallDef, key: []const u8, value: 
         }
         if (list.items.len > 0) call.args = list.toOwnedSlice(a) catch &.{};
     }
-}
-
-fn parseHexOrDec(comptime T: type, s: []const u8) !T {
-    const t = std.mem.trim(u8, s, " \t");
-    if (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X")) return std.fmt.parseUnsigned(T, t[2..], 16);
-    return std.fmt.parseUnsigned(T, t, 10);
 }

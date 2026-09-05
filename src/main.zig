@@ -4,10 +4,13 @@
 const std = @import("std");
 const cli = @import("cli/parser.zig");
 const types = @import("mem/types.zig");
+const mem_types = @import("mem/types.zig");
 const cheat = @import("cheat/mod.zig");
 const socket = @import("ipc/socket.zig");
 const daemon_mod = @import("engine/daemon.zig");
 const injector = @import("agent/inject.zig");
+const linject = @import("injector/linject.zig");
+const scanner = @import("scanner/mod.zig");
 const linux = std.os.linux;
 
 var gpa_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -34,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
         .version => printVersion(),
         .daemon => try cmdDaemon(&pa),
         .inject => try cmdInject(&pa),
+        .scan => try cmdScan(&pa),
         else => try cmdViaSocket(&pa),
     }
 }
@@ -49,7 +53,7 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
         if (pa.positional.items.len > 0) {
             _ = pa.positional.items[0];
         }
-        std.debug.print("Usage: zigh daemon --pid <pid>\n", .{});
+        std.debug.print("Usage: zigh daemon --pid <pid> [--inject] [--so <agent.so>]\n", .{});
         return;
     };
     const pid = std.fmt.parseUnsigned(u32, pid_str, 10) catch {
@@ -59,6 +63,7 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
 
     var d = try daemon_mod.Daemon.init(alloc, pid, 0);
     defer d.deinit();
+    d.startChainWorker();
 
     // Write PID file
     var pid_buf: [32]u8 = undefined;
@@ -67,6 +72,25 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
     if (@as(isize, @bitCast(fd)) < 0) { std.debug.print("Cannot write PID file\n", .{}); return; }
     _ = linux.write(@intCast(fd), pid_content.ptr, pid_content.len);
     _ = linux.close(@intCast(fd));
+
+    // Auto-inject agent if --inject is specified
+    const do_inject = pa.opts.contains("inject");
+    if (do_inject) {
+        const so_path = pa.getOpt("so") orelse "./zig-out/lib/libzigh_agent.so";
+        std.debug.print("[zigh] Injecting agent: {s}...\n", .{so_path});
+        var path_buf: [512]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{so_path});
+        injector.inject(alloc, pid, path_z, null) catch |err| {
+            std.debug.print("[zigh] Inject failed: {}\n", .{err});
+            return;
+        };
+        std.debug.print("[zigh] Waiting for agent to start...\n", .{});
+        d.waitForAgent(5000) catch |err| {
+            std.debug.print("[zigh] Agent not ready: {}\n", .{err});
+            return;
+        };
+        std.debug.print("[zigh] Agent is running!\n", .{});
+    }
 
     // Socket path
     var sock_buf: [64]u8 = undefined;
@@ -86,8 +110,10 @@ fn cmdDaemon(pa: *const cli.ParsedArgs) !void {
 
 fn cmdInject(pa: *const cli.ParsedArgs) !void {
     if (pa.positional.items.len < 2) {
-        std.debug.print("Usage: zigh inject <pid> <agent.so>\n", .{});
-        std.debug.print("  Injects the agent shared library into the target process.\n", .{});
+        std.debug.print("Usage: zigh inject <pid> <agent.so> [--hook <addr>] [--method linject]\n", .{});
+        std.debug.print("  Methods:\n", .{});
+        std.debug.print("    ptrace (default) — ptrace-based dlopen injection\n", .{});
+        std.debug.print("    linject         — function-hijack injection (no ptrace, works alongside GDB)\n", .{});
         std.debug.print("  The agent.so is built alongside zigh (zig-out/lib/libzigh_agent.so)\n", .{});
         return;
     }
@@ -101,12 +127,161 @@ fn cmdInject(pa: *const cli.ParsedArgs) !void {
         std.debug.print("Path too long\n", .{});
         return;
     };
+
+    const method = pa.getOpt("method") orelse "ptrace";
+
+    if (std.mem.eql(u8, method, "linject")) {
+        std.debug.print("[linject] Injecting {s} into PID {d} (function-hijack method)...\n", .{ path_z, pid });
+        // Default alloc_len: 64KB for small agents, override with --alloc-len <bytes>
+        const alloc_len_str = pa.getOpt("alloc-len") orelse "65536";
+        const alloc_len = std.fmt.parseUnsigned(u32, alloc_len_str, 10) catch @as(u32, 65536);
+        linject.injectSo(alloc, pid, path_z, alloc_len) catch |err| {
+            std.debug.print("[linject] Injection failed: {}\n", .{err});
+            return;
+        };
+        std.debug.print("[linject] Injection successful!\n", .{});
+        return;
+    }
+
+    // Default: ptrace method
     std.debug.print("Injecting {s} into PID {d}...\n", .{ path_z, pid });
-    injector.inject(pid, path_z) catch |err| {
+    const hook_str = pa.getOpt("hook");
+    const hook_addr: ?usize = if (hook_str) |hs| blk: {
+        break :blk std.fmt.parseUnsigned(usize, hs, 0) catch null;
+    } else null;
+    injector.inject(alloc, pid, path_z, hook_addr) catch |err| {
         std.debug.print("Injection failed: {}\n", .{err});
         return;
     };
     std.debug.print("Injection successful!\n", .{});
+}
+
+// ─── Scan command ────────────────────────────────────────────────────────
+
+fn cmdScan(pa: *const cli.ParsedArgs) !void {
+    const pid_str = pa.getOpt("pid") orelse {
+        // Try to get PID from running daemon
+        const pid = getPid() catch {
+            std.debug.print("Usage: zigh scan --pid <pid> --value <n> [--type <t>] [--option <opt>]\n", .{});
+            std.debug.print("  Options: exact, unknown, bigger_than, smaller_than, between\n", .{});
+            std.debug.print("  Next scan: --next --option changed|unchanged|increased|decreased\n", .{});
+            return;
+        };
+        return runScan(pid, pa);
+    };
+
+    const pid = std.fmt.parseUnsigned(u32, pid_str, 10) catch {
+        std.debug.print("Invalid PID: {s}\n", .{pid_str});
+        return;
+    };
+    try runScan(pid, pa);
+}
+
+fn runScan(pid: u32, pa: *const cli.ParsedArgs) !void {
+    const is_next = pa.opts.contains("next");
+    const opt_str = pa.getOpt("option") orelse if (is_next) "changed" else "exact";
+
+    const opt = scanner.types.ScanOption.parse(opt_str) orelse {
+        std.debug.print("Unknown scan option: {s}\n", .{opt_str});
+        return;
+    };
+
+    const type_str = pa.getOpt("type") orelse "u32";
+    const value_type = mem_types.TypeId.fromString(type_str) orelse {
+        std.debug.print("Unknown type: {s}\n", .{type_str});
+        return;
+    };
+
+    const max_mem_str = pa.getOpt("max-memory");
+    const max_mem: u32 = if (max_mem_str) |s| std.fmt.parseUnsigned(u32, s, 10) catch 256 else 256;
+
+    const value1: u64 = blk: {
+        if (pa.getOpt("value")) |v| {
+            break :blk parseScanValue(v, value_type) catch {
+                std.debug.print("Invalid value: {s}\n", .{v});
+                return;
+            };
+        }
+        break :blk 0;
+    };
+
+    const value2: u64 = blk: {
+        if (pa.getOpt("value2")) |v| {
+            break :blk parseScanValue(v, value_type) catch {
+                std.debug.print("Invalid value2: {s}\n", .{v});
+                return;
+            };
+        }
+        break :blk 0;
+    };
+
+    var session = try scanner.ScanSession.init(alloc, pid);
+    defer session.deinit();
+
+    // Check if a first scan was previously done (temp files exist)
+    var scan0_buf: [128]u8 = undefined;
+    const scan0_path = std.fmt.bufPrintZ(&scan0_buf, "/tmp/zigh_scan_{d}/scan_0.tmp", .{pid}) catch {
+        session.first_done = false;
+        return runScanImpl(pid, pa, &session, opt, value_type, value1, value2, is_next, max_mem) catch {};
+    };
+
+    const raw0 = linux.open(scan0_path, linux.O{}, 0);
+    if (@as(isize, @bitCast(raw0)) < 0) {
+        session.first_done = false;
+    } else {
+        _ = std.c.close(@intCast(raw0));
+        session.first_done = true;
+    }
+
+    try runScanImpl(pid, pa, &session, opt, value_type, value1, value2, is_next, max_mem);
+}
+
+fn runScanImpl(pid: u32, pa: *const cli.ParsedArgs, session: *scanner.ScanSession, opt: scanner.types.ScanOption, value_type: mem_types.TypeId, value1: u64, value2: u64, is_next: bool, max_mem: u32) !void {
+    _ = pid;
+    _ = pa;
+    session.cfg.max_memory_mb = max_mem;
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    if (is_next) {
+        if (!session.first_done) {
+            std.debug.print("No first scan found. Run a first scan first.\n", .{});
+            return;
+        }
+        std.debug.print("Next scan: {s}...\n", .{@tagName(opt)});
+        const results = try session.nextScan(arena, opt, value1);
+        std.debug.print("Found {d} results.\n", .{results.len});
+        for (results) |r| {
+            const val_str = mem_types.formatU64(r.value, value_type, arena) catch "?";
+            std.debug.print("  0x{x}: {s}\n", .{ r.address, val_str });
+        }
+    } else {
+        std.debug.print("First scan: {s}...\n", .{@tagName(opt)});
+        const results = try session.firstScan(arena, opt, value_type, value1, value2);
+        std.debug.print("Found {d} results.\n", .{results.len});
+        const show = @min(results.len, 100);
+        for (results[0..show]) |r| {
+            const val_str = mem_types.formatU64(r.value, value_type, arena) catch "?";
+            std.debug.print("  0x{x}: {s}\n", .{ r.address, val_str });
+        }
+        if (results.len > 100) {
+            std.debug.print("  ... and {d} more\n", .{results.len - 100});
+        }
+    }
+}
+
+fn parseScanValue(s: []const u8, tid: mem_types.TypeId) !u64 {
+    return switch (tid) {
+        .float32 => blk: {
+            const f: f32 = try std.fmt.parseFloat(f32, s);
+            break :blk @as(u64, @as(u32, @bitCast(f)));
+        },
+        .float64 => @as(u64, @bitCast(try std.fmt.parseFloat(f64, s))),
+        .int8, .int16, .int32, .int64 => @bitCast(try std.fmt.parseInt(i64, s, 0)),
+        else => try std.fmt.parseUnsigned(u64, s, 0),
+    };
 }
 
 // ─── Socket client commands ──────────────────────────────────────────────
@@ -165,9 +340,34 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
             defer alloc.free(resp);
             std.debug.print("{s}\n", .{resp});
         },
+        .@"chain-lock" => {
+            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh chain-lock <name> <val> --addr <rva> --chain <offs> [--module <name>] [--interval <ms>]\n", .{}); return; }
+            const ctid = pa.getOpt("type") orelse "u32";
+            const caddr = pa.getOpt("addr") orelse "0";
+            const cchain = pa.getOpt("chain") orelse "";
+            const cbase = pa.getOpt("base") orelse "0";
+            const cmodule = pa.getOpt("module") orelse "";
+            const cinterval = pa.getOpt("interval") orelse "300";
+            const cpayload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"value\":\"{s}\",\"type\":\"{s}\",\"address\":\"{s}\",\"chain\":\"{s}\",\"base\":\"{s}\",\"module\":\"{s}\",\"interval\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1], ctid, caddr, cchain, cbase, cmodule, cinterval });
+            defer alloc.free(cpayload);
+            const cresp = try client.send(alloc, .req_chain_lock, cpayload);
+            defer alloc.free(cresp);
+            std.debug.print("{s}\n", .{cresp});
+        },
+        .@"chain-unlock" => {
+            if (pa.positional.items.len < 1) { std.debug.print("Usage: zigh chain-unlock <name>\n", .{}); return; }
+            const upayload = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\"}}", .{pa.positional.items[0]});
+            defer alloc.free(upayload);
+            const uresp = try client.send(alloc, .req_chain_unlock, upayload);
+            defer alloc.free(uresp);
+            std.debug.print("{s}\n", .{uresp});
+        },
         .write => {
-            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh write <addr> <value>\n", .{}); return; }
-            const payload = try std.fmt.allocPrint(alloc, "{{\"addr\":\"{s}\",\"value\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1] });
+            if (pa.positional.items.len < 2) { std.debug.print("Usage: zigh write <addr> <value> [--type t] [--chain offs] [--base 0x...]\n", .{}); return; }
+            const tid = pa.getOpt("type") orelse "u32";
+            const chain = pa.getOpt("chain") orelse "";
+            const base = pa.getOpt("base") orelse "0";
+            const payload = try std.fmt.allocPrint(alloc, "{{\"addr\":\"{s}\",\"value\":\"{s}\",\"type\":\"{s}\",\"chain\":\"{s}\",\"base\":\"{s}\"}}", .{ pa.positional.items[0], pa.positional.items[1], tid, chain, base });
             defer alloc.free(payload);
             const resp = try client.send(alloc, .req_write, payload);
             defer alloc.free(resp);
@@ -224,6 +424,7 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
             std.debug.print("{s}\n", .{resp});
         },
         .inject => std.debug.print("inject: handled standalone\n", .{}),
+        .scan => std.debug.print("scan: handled standalone\n", .{}),
         else => unreachable,
     }
 }

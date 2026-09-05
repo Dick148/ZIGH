@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# zigh-scan — Hermes-friendly wrapper around ZIGH's memory scanner
+#
+# Multi-session: session files are /tmp/zigh_scan_session_<PID>
+# All commands that need a session accept --pid <PID>.
+#
+# Usage (from Hermes):
+#   zigh-scan find <process-name|pid>            — locate game PID, init session
+#   zigh-scan first --pid <PID> <value> <type> [option]
+#   zigh-scan next  --pid <PID> <option> [value]
+#   zigh-scan results --pid <PID> [--limit N]
+#   zigh-scan lock   --pid <PID> <name> <addr> <type> [value]
+#   zigh-scan status [--pid <PID>]               — show session(s)
+#   zigh-scan cleanup [--pid <PID>|--all]        — remove session(s)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ZIGH="${ZIGH_BIN:-${SCRIPT_DIR}/../zig-out/bin/zigh}"
+ZIGH_PID_FILE="/tmp/zigh_daemon.pid"
+SESSION_PREFIX="/tmp/zigh_scan_session_"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+die() { echo "SCAN_ERR: $*" >&2; exit 1; }
+info() { echo "SCAN: $*" >&2; }
+
+session_file() { echo "${SESSION_PREFIX}${1}"; }
+
+resolve_pid() {
+    local target="$1"
+    [[ "$target" =~ ^[0-9]+$ ]] && { echo "$target"; return 0; }
+
+    if [[ -f "$ZIGH_PID_FILE" ]]; then
+        local dp
+        dp=$(cat "$ZIGH_PID_FILE" 2>/dev/null | head -1 | tr -d '\n\r ')
+        [[ -n "$dp" && -d "/proc/$dp" ]] && { echo "$dp"; return 0; }
+    fi
+
+    local pid
+    pid=$(pgrep -x "$target" 2>/dev/null | head -1) && { echo "$pid"; return 0; }
+    pid=$(pgrep -i -f "$target" 2>/dev/null | head -1) && { echo "$pid"; return 0; }
+    return 1
+}
+
+# Extract --pid VALUE from anywhere in args. Outputs: pid on line 1, then
+# remaining args (one per line). Caller does: pid=$(extract ...) and
+# mapfile -t args < <(extract ... | tail -n +2)
+extract_pid() {
+    local pid=""
+    local rest=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pid) pid="$2"; shift 2 ;;
+            --pid=*) pid="${1#--pid=}"; shift ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    echo "$pid"
+    printf '%s\n' "${rest[@]}"
+}
+
+save_session() {
+    local pid="$1" type="$2" option="$3"
+    cat > "$(session_file "$pid")" <<EOF
+PID=$pid
+TYPE=$type
+OPTION=$option
+FIRST_DONE=true
+EOF
+}
+
+load_session() {
+    local pid="$1"
+    local sf
+    sf=$(session_file "$pid")
+    [[ -f "$sf" ]] || return 1
+    source "$sf" 2>/dev/null || return 1
+    [[ -n "${PID:-}" && -n "${FIRST_DONE:-}" ]] || return 1
+    return 0
+}
+
+ensure_zigh() {
+    [[ -x "$ZIGH" ]] || die "zigh binary not found at $ZIGH. Build: cd ~/myprojj/ZIGH && zig build"
+}
+
+require_pid() {
+    local pid="$1"
+    [[ -n "$pid" ]] || die "Missing --pid <PID>. Use 'zigh-scan find <name>' first."
+    [[ -d "/proc/$pid" ]] || die "Process $pid no longer exists."
+}
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+cmd_find() {
+    local target="${1:-}"
+    [[ -z "$target" ]] && die "Usage: zigh-scan find <process-name|pid>"
+
+    local pid
+    pid=$(resolve_pid "$target") || die "Cannot find process: $target"
+
+    local comm
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "unknown")
+
+    info "Found PID=$pid ($comm)"
+    save_session "$pid" "u32" "exact"
+    echo "SESSION: pid=$pid process=$comm session_file=$(session_file "$pid")"
+}
+
+cmd_first() {
+    local pid args_line
+    pid=$(extract_pid "$@" | head -1)
+    mapfile -t args < <(extract_pid "$@" | tail -n +2)
+
+    require_pid "$pid"
+    load_session "$pid" || die "No session for PID $pid. Run 'zigh-scan find <name>' first."
+
+    local value="${args[0]:-}" type="${args[1]:-u32}" option="${args[2]:-exact}"
+    [[ -z "$value" && "$option" != "unknown" ]] && die "Usage: zigh-scan first --pid <PID> <value> [type] [option]"
+
+    local zargs=(--pid "$pid" --type "$type" --option "$option")
+    [[ "$option" != "unknown" ]] && zargs+=(--value "$value")
+
+    # Extract --max-memory from original args if present
+    local orig_args=("$@")
+    for a in "${orig_args[@]}"; do
+        case "$a" in
+            --max-memory=*) zargs+=("$a") ;;
+        esac
+    done
+
+    info "First scan: pid=$pid type=$type option=$option value=${value:-N/A}"
+
+    local output
+    output=$("$ZIGH" scan "${zargs[@]}" 2>&1) || die "Scan failed"
+
+    local count
+    count=$(echo "$output" | grep -oP 'Found \K\d+' || echo "0")
+    info "Found $count results"
+
+    save_session "$pid" "$type" "$option"
+    emit_results "$output" "$count"
+}
+
+cmd_next() {
+    local pid
+    pid=$(extract_pid "$@" | head -1)
+    mapfile -t args < <(extract_pid "$@" | tail -n +2)
+
+    require_pid "$pid"
+    load_session "$pid" || die "No session for PID $pid."
+
+    local option="${args[0]:-changed}" value="${args[1]:-}"
+    [[ "${FIRST_DONE:-}" != "true" ]] && die "No first scan done for PID $pid."
+
+    local zargs=(--pid "$pid" --next --option "$option")
+    [[ -n "$value" ]] && zargs+=(--value "$value")
+
+    info "Next scan: pid=$pid option=$option value=${value:-N/A}"
+
+    local output
+    output=$("$ZIGH" scan "${zargs[@]}" 2>&1) || die "Scan failed"
+
+    local count
+    count=$(echo "$output" | grep -oP 'Found \K\d+' || echo "0")
+    info "Found $count results"
+
+    save_session "$pid" "${TYPE:-u32}" "$option"
+    emit_results "$output" "$count"
+}
+
+cmd_results() {
+    local pid
+    pid=$(extract_pid "$@" | head -1)
+    mapfile -t args < <(extract_pid "$@" | tail -n +2)
+
+    require_pid "$pid"
+    load_session "$pid" || die "No session for PID $pid."
+
+    local limit=50
+    for a in "${args[@]}"; do
+        case "$a" in
+            --limit) ;; # handled in calling code
+            --limit=*) limit="${a#--limit=}" ;;
+            *) ;;
+        esac
+    done
+
+    local output
+    output=$("$ZIGH" scan --pid "$pid" --next --option unchanged 2>&1) || {
+        echo "RESULT_COUNT: 0"
+        echo "NOTE: Scan session expired. Re-run first scan."
+        return 0
+    }
+
+    local count
+    count=$(echo "$output" | grep -oP 'Found \K\d+' || echo "0")
+    echo "RESULT_COUNT: $count"
+    echo "SESSION: pid=$pid type=${TYPE:-u32}"
+
+    local shown=0
+    echo "$output" | grep -oP '^\s*0x[0-9a-f]+: .*' | while read -r line; do
+        [[ $shown -ge $limit ]] && break
+        local addr val
+        addr=$(echo "$line" | awk '{print $1}' | tr -d ':')
+        val=$(echo "$line" | awk '{print $2}')
+        echo "RESULT: $addr $val"
+        shown=$((shown + 1))
+    done
+}
+
+cmd_lock() {
+    local pid
+    pid=$(extract_pid "$@" | head -1)
+    mapfile -t args < <(extract_pid "$@" | tail -n +2)
+
+    require_pid "$pid"
+
+    local name="${args[0]:-}" addr="${args[1]:-}" type="${args[2]:-u32}" value="${args[3]:-}"
+    [[ -z "$name" || -z "$addr" ]] && die "Usage: zigh-scan lock --pid <PID> <name> <addr> [type] [value]"
+
+    if [[ ! -f "$ZIGH_PID_FILE" ]]; then
+        die "No daemon running. Start: zigh daemon --pid $pid &"
+    fi
+
+    if [[ -n "$value" ]]; then
+        "$ZIGH" lock-add "$name" "$value" --type "$type" --addr "$addr" 2>&1
+    else
+        "$ZIGH" lock-add "$name" 0 --type "$type" --addr "$addr" 2>&1
+    fi
+
+    echo "LOCKED: $name at $addr type=$type"
+}
+
+cmd_cleanup() {
+    local pid
+    pid=$(extract_pid "$@" | head -1)
+    mapfile -t args < <(extract_pid "$@" | tail -n +2)
+
+    local clean_all=false
+    for a in "${args[@]}"; do
+        [[ "$a" == "--all" ]] && clean_all=true
+    done
+
+    if $clean_all; then
+        rm -f "${SESSION_PREFIX}"*
+        rm -rf /tmp/zigh_scan_* 2>/dev/null || true
+        info "Cleaned all sessions"
+        echo "CLEANUP: all"
+        return
+    fi
+
+    if [[ -n "$pid" ]]; then
+        rm -f "$(session_file "$pid")"
+        rm -rf "/tmp/zigh_scan_${pid}" 2>/dev/null || true
+        info "Cleaned session for PID $pid"
+        echo "CLEANUP: pid=$pid"
+        return
+    fi
+
+    die "Usage: zigh-scan cleanup --pid <PID> | --all"
+}
+
+cmd_status() {
+    local pid
+    pid=$(extract_pid "$@" | head -1)
+
+    if [[ -n "$pid" ]]; then
+        if load_session "$pid" 2>/dev/null; then
+            echo "SESSION: pid=${PID} type=${TYPE:-?} option=${OPTION:-?} first_done=${FIRST_DONE:-false} session_file=$(session_file "$pid")"
+        else
+            echo "SESSION: pid=$pid (no active session)"
+        fi
+        return
+    fi
+
+    # List all sessions
+    local found=false
+    for sf in "${SESSION_PREFIX}"*; do
+        [[ -f "$sf" ]] || continue
+        source "$sf" 2>/dev/null || continue
+        local spid="${PID:-?}"
+        echo "SESSION: pid=$spid type=${TYPE:-?} option=${OPTION:-?} first_done=${FIRST_DONE:-false}"
+        found=true
+    done
+    $found || echo "SESSION: none"
+}
+
+# ── result emission (shared by first/next) ────────────────────────────────
+
+emit_results() {
+    local output="$1" count="$2"
+    echo "RESULT_COUNT: $count"
+    echo "$output" | grep -oP '^\s*0x[0-9a-f]+: .*' | while read -r line; do
+        local addr val
+        addr=$(echo "$line" | awk '{print $1}' | tr -d ':')
+        val=$(echo "$line" | awk '{print $2}')
+        echo "RESULT: $addr $val"
+    done
+    if [[ "$count" -gt 100 ]]; then
+        echo "NOTE: $((count - 100)) results omitted (use results --limit to show more)"
+    fi
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+ensure_zigh
+
+case "${1:-}" in
+    find)     shift; cmd_find "$@" ;;
+    first)    shift; cmd_first "$@" ;;
+    next)     shift; cmd_next "$@" ;;
+    results)  shift; cmd_results "$@" ;;
+    lock)     shift; cmd_lock "$@" ;;
+    cleanup)  shift; cmd_cleanup "$@" ;;
+    status)   shift; cmd_status "$@" ;;
+    *)
+        echo "Usage: zigh-scan {find|first|next|results|lock|cleanup|status} [--pid <PID>] [args...]"
+        echo ""
+        echo "  zigh-scan find <name|pid>                     Locate game process"
+        echo "  zigh-scan first --pid <PID> <val> [type] [opt] First scan"
+        echo "  zigh-scan next  --pid <PID> <opt> [value]      Next scan"
+        echo "  zigh-scan results --pid <PID> [--limit N]      Show results"
+        echo "  zigh-scan lock --pid <PID> <name> <addr> <t> <v> Lock via daemon"
+        echo "  zigh-scan status [--pid <PID>]                 Show session(s)"
+        echo "  zigh-scan cleanup --pid <PID> | --all           Remove session(s)"
+        echo ""
+        echo "Types:  u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 ptr bytes"
+        echo "Options (first): exact unknown bigger_than smaller_than between"
+        echo "Options (next):  changed unchanged increased decreased increased_by decreased_by"
+        exit 1
+        ;;
+esac

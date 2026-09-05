@@ -31,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .root_module = agent_mod,
         .linkage = .dynamic,
     });
+    agent_mod.addCSourceFile(.{ .file = b.path("src/agent/init.c"), .flags = &.{} });
     b.installArtifact(agent);
 
     const run_cmd = b.addRunArtifact(exe);

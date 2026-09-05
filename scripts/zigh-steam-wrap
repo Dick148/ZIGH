@@ -1,0 +1,15 @@
+#!/bin/bash
+# Steam launch wrapper for ZIGH agent injection.
+# Set this as Steam launch option: /path/to/zigh-steam-wrap %command%
+# 
+# It starts the daemon BEFORE the game, then execs the game with LD_PRELOAD.
+# Both daemon and game run on the host (outside pressure-vessel for /dev/shm).
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ZIGH="${SCRIPT_DIR}/../zig-out/bin/zigh"
+AGENT="${SCRIPT_DIR}/../zig-out/lib/libzigh_agent.so"
+
+# Start the game with LD_PRELOAD
+echo "[zigh-wrap] Starting with LD_PRELOAD..."
+export LD_PRELOAD="$AGENT"
+exec "$@"
