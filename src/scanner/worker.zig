@@ -1,6 +1,7 @@
 // ZIGH — Scanner worker thread
-// Each worker scans its assigned memory regions independently.
-// Results written to per-thread temp files; merged by the engine.
+// Each worker pulls fixed-size jobs from a shared atomic queue, reads the
+// target's memory in chunks, compares typed values and writes 16-byte result
+// records to its own temp file. The engine merges the files.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -8,41 +9,44 @@ const types = @import("types.zig");
 const mem_types = @import("../mem/types.zig");
 const mem_mod = @import("../mem/mod.zig");
 const util = @import("../util.zig");
+const value = @import("value.zig");
 
 const CHUNK_SIZE = 256 * 1024; // 256KB read chunks
 const FLUSH_THRESHOLD = 1024; // flush results to file every N matches
 
-/// A single-threaded scanner that processes assigned memory regions.
+/// A single-threaded scanner that processes jobs pulled from a shared queue.
 pub const ScanWorker = struct {
-    allocator: std.mem.Allocator,
     pid: u32,
     mem_fd: linux.fd_t,
-    /// Regions assigned to this worker (slice into engine-owned array)
-    regions: []const types.MemoryRegion,
-    /// Scan parameters
+    jobs: []const types.Job,
+    counter: *std.atomic.Value(usize),
     cfg: types.ScanConfig,
-    /// Temp file fd for results (address,value pairs)
     result_fd: linux.fd_t,
-    /// Accumulated result count
     found: u32 = 0,
-    /// Accumulated byte count scanned
     scanned: u64 = 0,
 
     const Self = @This();
 
-    /// Initialize a worker. Opens its own /proc/PID/mem fd.
-    pub fn init(allocator: std.mem.Allocator, pid: u32, regions: []const types.MemoryRegion, cfg: types.ScanConfig, result_path: [:0]const u8) !Self {
-        const raw = linux.open(result_path, linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    pub fn init(
+        pid: u32,
+        jobs: []const types.Job,
+        counter: *std.atomic.Value(usize),
+        cfg: types.ScanConfig,
+        result_path: [:0]const u8,
+    ) !Self {
+        const raw = linux.open(result_path, linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, 0o600);
         if (@as(isize, @bitCast(raw)) < 0) return error.OpenResultFileFailed;
 
-        const mem_fd = try mem_mod.openProcMem(pid);
-        errdefer _ = std.c.close(mem_fd);
+        const mem_fd = mem_mod.openProcMem(pid) catch |e| {
+            _ = std.c.close(@intCast(raw));
+            return e;
+        };
 
         return Self{
-            .allocator = allocator,
             .pid = pid,
             .mem_fd = mem_fd,
-            .regions = regions,
+            .jobs = jobs,
+            .counter = counter,
             .cfg = cfg,
             .result_fd = @intCast(raw),
         };
@@ -53,98 +57,91 @@ pub const ScanWorker = struct {
         _ = std.c.close(self.result_fd);
     }
 
-    /// Run the scan over assigned regions. Returns total results found.
+    /// Run until the shared job queue is exhausted. Returns total results.
     pub fn run(self: *Self) !u32 {
-        // Allocate scan buffer once (reused across reads)
-        const buf = try self.allocator.alloc(u8, CHUNK_SIZE + self.cfg.value_type.size());
-        defer self.allocator.free(buf);
+        const alloc = std.heap.page_allocator;
+        const buf = try alloc.alloc(u8, CHUNK_SIZE);
+        defer alloc.free(buf);
 
-        // Result accumulation buffer (flush to file periodically)
         var result_buf: std.ArrayList(u8) = .empty;
-        defer result_buf.deinit(self.allocator);
+        defer result_buf.deinit(alloc);
+        try result_buf.ensureTotalCapacity(alloc, FLUSH_THRESHOLD * 16);
 
-        // Ensure result_buf has enough capacity for FLUSH_THRESHOLD records
-        try result_buf.ensureTotalCapacity(self.allocator, FLUSH_THRESHOLD * 16);
-
-        for (self.regions) |region| {
-            var offset: usize = 0;
-            while (offset < region.size) {
-                const remaining = region.size - offset;
-                const to_read = if (remaining < CHUNK_SIZE) remaining else CHUNK_SIZE;
-
-                mem_mod.readRaw(self.mem_fd, region.base + offset, buf[0..to_read]) catch {
-                    offset += to_read;
-                    self.scanned += to_read;
-                    continue;
-                };
-                self.scanned += to_read;
-
-                try self.scanBuffer(
-                    buf[0..to_read],
-                    region.base + offset,
-                    &result_buf,
-                );
-
-                offset += to_read;
-            }
-
-            // Flush after each region
-            if (result_buf.items.len > 0) {
-                _ = linux.write(self.result_fd, result_buf.items.ptr, result_buf.items.len);
-                result_buf.clearRetainingCapacity();
-            }
+        while (true) {
+            const idx = self.counter.fetchAdd(1, .monotonic);
+            if (idx >= self.jobs.len) break;
+            try self.scanJob(self.jobs[idx], buf, &result_buf);
         }
 
+        try self.flush(&result_buf);
         return self.found;
     }
 
-    /// Scan a memory buffer, appending results to result_buf
-    fn scanBuffer(self: *Self, buf: []u8, base_addr: usize, result_buf: *std.ArrayList(u8)) !void {
-        const type_size = self.cfg.value_type.size();
-        if (buf.len < type_size) return;
+    fn flush(self: *Self, result_buf: *std.ArrayList(u8)) !void {
+        if (result_buf.items.len == 0) return;
+        try util.writeAll(self.result_fd, result_buf.items);
+        result_buf.clearRetainingCapacity();
+    }
+
+    fn scanJob(self: *Self, job: types.Job, buf: []u8, result_buf: *std.ArrayList(u8)) !void {
+        const tid = self.cfg.value_type;
+        const type_size = tid.size();
+        if (job.size < type_size) return;
 
         const step: usize = if (self.cfg.fast_scan) type_size else 1;
-        const end = buf.len - type_size;
+        // Unaligned scans need the last (type_size - 1) bytes carried into the
+        // next read so values straddling a chunk boundary are not missed.
+        const overlap: usize = if (step == 1) type_size - 1 else 0;
 
-        var pos: usize = 0;
-        while (pos <= end) : (pos += step) {
-            const addr = base_addr + pos;
-            const current = readValue(buf[pos..], self.cfg.value_type);
+        var offset: usize = 0;
+        while (offset < job.size) {
+            const remaining = job.size - offset;
+            const to_read = @min(remaining, CHUNK_SIZE);
 
-            if (self.checkMatch(current)) {
-                self.found += 1;
+            mem_mod.readRaw(self.mem_fd, job.base + offset, buf[0..to_read]) catch {
+                self.scanned += to_read;
+                offset += to_read;
+                continue;
+            };
+            self.scanned += to_read;
 
-                // Append to result buffer (binary: 8 bytes addr + 8 bytes value)
-                var record: [16]u8 = undefined;
-                std.mem.writeInt(u64, record[0..8], @intCast(addr), .little);
-                std.mem.writeInt(u64, record[8..16], current, .little);
-                try result_buf.appendSlice(self.allocator, &record);
+            if (to_read >= type_size) {
+                const end = to_read - type_size;
+                var pos: usize = 0;
+                while (pos <= end) : (pos += step) {
+                    const current = value.decode(buf[pos..], tid);
+                    if (value.matchesFirst(
+                        self.cfg.scan_option,
+                        current,
+                        tid,
+                        self.cfg.value1,
+                        self.cfg.value2,
+                        self.cfg.epsilon,
+                    )) {
+                        self.found += 1;
+                        var record: [16]u8 = undefined;
+                        std.mem.writeInt(u64, record[0..8], @intCast(job.base + offset + pos), .little);
+                        std.mem.writeInt(u64, record[8..16], current, .little);
+                        try result_buf.appendSlice(std.heap.page_allocator, &record);
 
-                // Flush when buffer is full
-                if (self.found % FLUSH_THRESHOLD == 0) {
-                    _ = linux.write(self.result_fd, result_buf.items.ptr, result_buf.items.len);
-                    result_buf.clearRetainingCapacity();
+                        if (self.found % FLUSH_THRESHOLD == 0) try self.flush(result_buf);
+                    }
                 }
+            }
+
+            if (overlap > 0 and to_read > overlap and offset + to_read < job.size) {
+                offset += to_read - overlap;
+            } else {
+                offset += to_read;
             }
         }
     }
-
-    /// Check if a value matches the scan option
-    fn checkMatch(self: *const Self, value: u64) bool {
-        return switch (self.cfg.scan_option) {
-            .exact => value == self.cfg.value1,
-            .bigger_than => value > self.cfg.value1,
-            .smaller_than => value < self.cfg.value1,
-            .between => value >= self.cfg.value1 and value <= self.cfg.value2,
-            .unknown => true,
-            .changed, .unchanged, .increased, .decreased, .increased_by, .decreased_by => false,
-        };
-    }
 };
 
-/// A worker for next scans — compares current value against previous scan results.
+/// A worker for next scans. Previous-scan records are streamed from disk and
+/// grouped by 64KB window, then current memory is read once per window (with a
+/// per-page fallback) instead of once per record.
 pub const NextScanWorker = struct {
-    allocator: std.mem.Allocator,
     pid: u32,
     mem_fd: linux.fd_t,
     cfg: types.ScanConfig,
@@ -155,18 +152,28 @@ pub const NextScanWorker = struct {
 
     const Self2 = @This();
 
-    pub fn init(allocator: std.mem.Allocator, pid: u32, cfg: types.ScanConfig, result_path: [:0]const u8, prev_path: [:0]const u8) !Self2 {
-        const raw_res = linux.open(result_path, linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    pub fn init(
+        pid: u32,
+        cfg: types.ScanConfig,
+        result_path: [:0]const u8,
+        prev_path: [:0]const u8,
+    ) !Self2 {
+        const raw_res = linux.open(result_path, linux.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, 0o600);
         if (@as(isize, @bitCast(raw_res)) < 0) return error.OpenResultFileFailed;
 
-        const raw_prev = linux.open(prev_path, linux.O{}, 0);
-        if (@as(isize, @bitCast(raw_prev)) < 0) return error.OpenPrevFileFailed;
+        const raw_prev = linux.open(prev_path, linux.O{ .NOFOLLOW = true }, 0);
+        if (@as(isize, @bitCast(raw_prev)) < 0) {
+            _ = std.c.close(@intCast(raw_res));
+            return error.OpenPrevFileFailed;
+        }
 
-        const mem_fd = try mem_mod.openProcMem(pid);
-        errdefer _ = std.c.close(mem_fd);
+        const mem_fd = mem_mod.openProcMem(pid) catch |e| {
+            _ = std.c.close(@intCast(raw_res));
+            _ = std.c.close(@intCast(raw_prev));
+            return e;
+        };
 
         return Self2{
-            .allocator = allocator,
             .pid = pid,
             .mem_fd = mem_fd,
             .cfg = cfg,
@@ -181,85 +188,232 @@ pub const NextScanWorker = struct {
         _ = std.c.close(self.prev_fd);
     }
 
-    const STREAM_CHUNK_BYTES = 64 * 1024; // 64KB chunks = 4096 records per read
+    const STREAM_CHUNK_BYTES = 64 * 1024; // 64KB of records per file read
+    const WINDOW_SHIFT = 16; // batch records by 64KB address window
+    const WINDOW_SIZE = 1 << WINDOW_SHIFT;
+    const PAGE_SIZE: usize = 4096;
+    const PAGE_MASK: usize = PAGE_SIZE - 1;
+    const MAX_PENDING_RECORDS = 16384;
 
-    /// Read previous scan results, re-read memory for each address, compare, write matching ones.
+    /// Records buffered for the current 64KB window.
+    const Batch = struct {
+        addrs: std.ArrayList(usize) = .empty,
+        vals: std.ArrayList(u64) = .empty,
+        window: usize = std.math.maxInt(usize),
+
+        fn deinit(self: *Batch, alloc: std.mem.Allocator) void {
+            self.addrs.deinit(alloc);
+            self.vals.deinit(alloc);
+        }
+
+        fn clear(self: *Batch) void {
+            self.addrs.clearRetainingCapacity();
+            self.vals.clearRetainingCapacity();
+            self.window = std.math.maxInt(usize);
+        }
+
+        fn count(self: *const Batch) usize {
+            return self.addrs.items.len;
+        }
+    };
+
     pub fn run(self: *Self2) !u32 {
+        const alloc = std.heap.page_allocator;
+
         var result_buf: std.ArrayList(u8) = .empty;
-        defer result_buf.deinit(self.allocator);
-        try result_buf.ensureTotalCapacity(self.allocator, FLUSH_THRESHOLD * 16);
+        defer result_buf.deinit(alloc);
+        try result_buf.ensureTotalCapacity(alloc, FLUSH_THRESHOLD * 16);
 
-        const type_size = self.cfg.value_type.size();
-        var val_buf: [8]u8 = [_]u8{0} ** 8;
+        var batch: Batch = .{};
+        defer batch.deinit(alloc);
+        try batch.addrs.ensureTotalCapacity(alloc, MAX_PENDING_RECORDS);
+        try batch.vals.ensureTotalCapacity(alloc, MAX_PENDING_RECORDS);
 
-        // Stream previous results in chunks instead of loading all into RAM at once
-        const chunk = try self.allocator.alloc(u8, STREAM_CHUNK_BYTES);
-        defer self.allocator.free(chunk);
+        const chunk = try alloc.alloc(u8, STREAM_CHUNK_BYTES);
+        defer alloc.free(chunk);
+        const window_buf = try alloc.alloc(u8, WINDOW_SIZE);
+        defer alloc.free(window_buf);
+        const page_buf = try alloc.alloc(u8, PAGE_SIZE);
+        defer alloc.free(page_buf);
+
+        // Records are streamed in 16-byte units; carry a partial record across
+        // reads so a short read cannot desynchronize the stream.
+        var tail: [16]u8 = undefined;
+        var tail_len: usize = 0;
 
         while (true) {
             const n = linux.read(self.prev_fd, chunk.ptr, chunk.len);
-            if (n <= 0) break;
-            const bytes = chunk[0..@as(usize, @intCast(n))];
-            const rec_count = bytes.len / 16;
-            const records: [][16]u8 align(1) = @as([*][16]u8, @ptrCast(bytes.ptr))[0..rec_count];
+            switch (linux.errno(n)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.ReadPrevFailed,
+            }
+            if (n == 0) break;
 
-            for (records) |rec| {
-                const addr: usize = @intCast(std.mem.readInt(u64, rec[0..8], .little));
-                const old_val: u64 = std.mem.readInt(u64, rec[8..16], .little);
+            var bytes: []const u8 = chunk[0..n];
 
-                // Re-read current value from process
-                mem_mod.readRaw(self.mem_fd, addr, val_buf[0..type_size]) catch continue;
-                const current = readValue(val_buf[0..], self.cfg.value_type);
-                self.scanned += 1;
-
-                if (self.checkNextMatch(current, old_val)) {
-                    self.found += 1;
-
-                    var record: [16]u8 = undefined;
-                    std.mem.writeInt(u64, record[0..8], @intCast(addr), .little);
-                    std.mem.writeInt(u64, record[8..16], current, .little);
-                    try result_buf.appendSlice(self.allocator, &record);
-
-                    if (self.found % FLUSH_THRESHOLD == 0) {
-                        _ = linux.write(self.result_fd, result_buf.items.ptr, result_buf.items.len);
-                        result_buf.clearRetainingCapacity();
-                    }
+            if (tail_len > 0) {
+                const need = 16 - tail_len;
+                if (bytes.len < need) {
+                    @memcpy(tail[tail_len..][0..bytes.len], bytes);
+                    tail_len += bytes.len;
+                    continue;
                 }
+                @memcpy(tail[tail_len..][0..need], bytes[0..need]);
+                try self.addRecord(tail[0..], &batch, window_buf, page_buf, &result_buf);
+                tail_len = 0;
+                bytes = bytes[need..];
+            }
+
+            const rec_count = bytes.len / 16;
+            const records: []const [16]u8 align(1) = @as([*]const [16]u8, @ptrCast(bytes.ptr))[0..rec_count];
+            for (records) |rec| {
+                try self.addRecord(rec[0..], &batch, window_buf, page_buf, &result_buf);
+            }
+
+            const consumed = rec_count * 16;
+            const rem = bytes.len - consumed;
+            if (rem > 0) {
+                @memcpy(tail[0..rem], bytes[consumed..]);
+                tail_len = rem;
             }
         }
 
+        try self.flushBatch(&batch, window_buf, page_buf, &result_buf);
+
         if (result_buf.items.len > 0) {
-            _ = linux.write(self.result_fd, result_buf.items.ptr, result_buf.items.len);
+            try util.writeAll(self.result_fd, result_buf.items);
         }
 
         return self.found;
     }
 
-    fn checkNextMatch(self: *const Self2, current: u64, old: u64) bool {
-        return switch (self.cfg.scan_option) {
-            .exact => current == self.cfg.value1,
-            .unknown => true,
-            .changed => current != old,
-            .unchanged => current == old,
-            .increased => @as(i64, @bitCast(current)) > @as(i64, @bitCast(old)),
-            .decreased => @as(i64, @bitCast(current)) < @as(i64, @bitCast(old)),
-            .increased_by => @as(i64, @bitCast(current)) - @as(i64, @bitCast(old)) == @as(i64, @bitCast(self.cfg.value1)),
-            .decreased_by => @as(i64, @bitCast(old)) - @as(i64, @bitCast(current)) == @as(i64, @bitCast(self.cfg.value1)),
-            .bigger_than => current > self.cfg.value1,
-            .smaller_than => current < self.cfg.value1,
-            .between => current >= self.cfg.value1 and current <= self.cfg.value2,
+    fn addRecord(
+        self: *Self2,
+        rec: []const u8,
+        batch: *Batch,
+        window_buf: []u8,
+        page_buf: []u8,
+        result_buf: *std.ArrayList(u8),
+    ) !void {
+        const addr: usize = @intCast(std.mem.readInt(u64, rec[0..8], .little));
+        const old_val: u64 = std.mem.readInt(u64, rec[8..16], .little);
+        const window = addr >> WINDOW_SHIFT;
+
+        if (batch.count() > 0 and (batch.window != window or batch.count() >= MAX_PENDING_RECORDS)) {
+            try self.flushBatch(batch, window_buf, page_buf, result_buf);
+        }
+
+        batch.window = window;
+        try batch.addrs.append(std.heap.page_allocator, addr);
+        try batch.vals.append(std.heap.page_allocator, old_val);
+    }
+
+    fn flushBatch(
+        self: *Self2,
+        batch: *Batch,
+        window_buf: []u8,
+        page_buf: []u8,
+        result_buf: *std.ArrayList(u8),
+    ) !void {
+        const n = batch.count();
+        if (n == 0) return;
+        defer batch.clear();
+
+        const tid = self.cfg.value_type;
+        const tsz = tid.size();
+        const addrs = batch.addrs.items;
+        const vals = batch.vals.items;
+
+        // Read only the pages spanned by these records (at most one 64KB
+        // window). If the span crosses an unmapped page the read fails and we
+        // fall back to one read per page, then to one read per record.
+        const read_base = addrs[0] & ~PAGE_MASK;
+        const read_end = (addrs[n - 1] & ~PAGE_MASK) + PAGE_SIZE;
+        const read_len = read_end - read_base;
+
+        const window_ok = blk: {
+            if (read_len > window_buf.len) break :blk false;
+            mem_mod.readRaw(self.mem_fd, read_base, window_buf[0..read_len]) catch break :blk false;
+            break :blk true;
         };
+
+        if (window_ok) {
+            for (addrs, vals) |addr, old_val| {
+                const off = addr - read_base;
+                if (off + tsz <= read_len) {
+                    self.scanned += 1;
+                    const current = value.decode(window_buf[off..], tid);
+                    try self.compareAndEmit(addr, current, old_val, result_buf);
+                } else {
+                    try self.processDirect(addr, old_val, result_buf);
+                }
+            }
+            return;
+        }
+
+        var cur_page: usize = std.math.maxInt(usize);
+        var page_ok = false;
+        for (addrs, vals) |addr, old_val| {
+            const page = addr & ~PAGE_MASK;
+            if (page != cur_page) {
+                cur_page = page;
+                page_ok = blk: {
+                    mem_mod.readRaw(self.mem_fd, page, page_buf[0..PAGE_SIZE]) catch break :blk false;
+                    break :blk true;
+                };
+            }
+
+            if (page_ok) {
+                const off = addr - page;
+                if (off + tsz <= PAGE_SIZE) {
+                    self.scanned += 1;
+                    const current = value.decode(page_buf[off..], tid);
+                    try self.compareAndEmit(addr, current, old_val, result_buf);
+                    continue;
+                }
+            }
+
+            try self.processDirect(addr, old_val, result_buf);
+        }
+    }
+
+    fn processDirect(self: *Self2, addr: usize, old_val: u64, result_buf: *std.ArrayList(u8)) !void {
+        const tid = self.cfg.value_type;
+        var val_buf: [8]u8 = undefined;
+        mem_mod.readRaw(self.mem_fd, addr, val_buf[0..tid.size()]) catch return;
+        self.scanned += 1;
+        const current = value.decode(val_buf[0..], tid);
+        try self.compareAndEmit(addr, current, old_val, result_buf);
+    }
+
+    fn compareAndEmit(
+        self: *Self2,
+        addr: usize,
+        current: u64,
+        old_val: u64,
+        result_buf: *std.ArrayList(u8),
+    ) !void {
+        if (!value.matchesNext(
+            self.cfg.scan_option,
+            current,
+            old_val,
+            self.cfg.value_type,
+            self.cfg.value1,
+            self.cfg.value2,
+            self.cfg.epsilon,
+        )) return;
+
+        self.found += 1;
+
+        var record: [16]u8 = undefined;
+        std.mem.writeInt(u64, record[0..8], @intCast(addr), .little);
+        std.mem.writeInt(u64, record[8..16], current, .little);
+        try result_buf.appendSlice(std.heap.page_allocator, &record);
+
+        if (self.found % FLUSH_THRESHOLD == 0) {
+            try util.writeAll(self.result_fd, result_buf.items);
+            result_buf.clearRetainingCapacity();
+        }
     }
 };
-
-/// Read a typed value from a byte slice at offset 0
-fn readValue(buf: []const u8, tid: mem_types.TypeId) u64 {
-    const sz = tid.size();
-    return switch (sz) {
-        1 => @as(u64, buf[0]),
-        2 => @as(u64, std.mem.readInt(u16, buf[0..2], .little)),
-        4 => @as(u64, std.mem.readInt(u32, buf[0..4], .little)),
-        8 => std.mem.readInt(u64, buf[0..8], .little),
-        else => 0,
-    };
-}

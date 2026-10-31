@@ -18,17 +18,15 @@ pub fn openProcMem(pid: u32) !linux.fd_t {
 }
 
 /// Read raw bytes from a process's memory at a given address.
-/// Returns error on failed or short reads.
+/// Reads the full buffer or returns an error — a short read must never be
+/// treated as success because the caller reuses its buffer.
 pub fn readRaw(fd: linux.fd_t, addr: usize, buf: []u8) !void {
-    const n = linux.pread(fd, buf.ptr, buf.len, @intCast(addr));
-    if (@as(isize, @bitCast(n)) < 0) return error.ReadFailed;
+    try util.preadAll(fd, buf, addr);
 }
 
 /// Write raw bytes to a process's memory at a given address.
-/// Returns error on failed writes.
 pub fn writeRaw(fd: linux.fd_t, addr: usize, buf: []const u8) !void {
-    const n = linux.pwrite(fd, buf.ptr, buf.len, @intCast(addr));
-    if (@as(isize, @bitCast(n)) < 0) return error.WriteFailed;
+    try util.pwriteAll(fd, buf, addr);
 }
 
 /// Read from remote process via process_vm_readv (no /proc/PID/mem fd needed).

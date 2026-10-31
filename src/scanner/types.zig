@@ -28,7 +28,6 @@ pub const ScanOption = enum {
     pub fn isNextOnly(self: ScanOption) bool {
         return switch (self) {
             .changed, .unchanged, .increased, .decreased, .increased_by, .decreased_by => true,
-            .unknown => true, // unknown implies first scan
             else => false,
         };
     }
@@ -55,6 +54,24 @@ pub const MemoryRegion = struct {
     size: usize,
     /// Offset into the previous scan's mirror file (used for next scans)
     mirror_offset: u64,
+};
+
+/// A unit of scan work. Regions are split into fixed-size jobs so that large
+/// regions can be processed by multiple threads and so that the workload can
+/// be scheduled dynamically.
+pub const Job = struct {
+    base: usize,
+    size: usize,
+    /// Offset of `base` inside MEMORY.TMP (snapshot modes only)
+    snapshot_offset: u64,
+};
+
+/// Per-thread result/error slot. Thread.spawn callbacks return void so errors
+/// must be carried explicitly instead of being discarded by Thread.join().
+pub const ThreadOutcome = struct {
+    found: u32 = 0,
+    scanned: u64 = 0,
+    err: ?anyerror = null,
 };
 
 /// A single scan result
@@ -87,6 +104,11 @@ pub const ScanConfig = struct {
     thread_count: u32 = 0,
     /// Use fast aligned scanning (skip align bytes)
     fast_scan: bool = true,
+    /// Only scan writable mappings (CE-style default). Values in a game almost
+    /// always live in writable heap/data pages; `--all` turns this off.
+    writable_only: bool = true,
+    /// Float comparison tolerance. 0 means exact bit-pattern equality.
+    epsilon: f64 = 0,
     /// Max memory (MB) to use for keeping scan results in RAM.
     /// Beyond this, results stay disk-only and are read in chunks.
     /// 0 = unlimited (default 256 MB).

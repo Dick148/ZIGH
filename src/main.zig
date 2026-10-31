@@ -215,8 +215,29 @@ fn runScan(pid: u32, pa: *const cli.ParsedArgs) !void {
         break :blk 0;
     };
 
+    const epsilon: f64 = blk: {
+        if (pa.getOpt("epsilon")) |v| {
+            break :blk std.fmt.parseFloat(f64, v) catch {
+                std.debug.print("Invalid epsilon: {s}\n", .{v});
+                return;
+            };
+        }
+        break :blk 0;
+    };
+
+    if (!is_next and opt.isNextOnly()) {
+        std.debug.print("Option '{s}' can only be used with --next\n", .{opt_str});
+        return;
+    }
+    if (is_next and opt == .unknown) {
+        std.debug.print("Option 'unknown' is only valid for a first scan\n", .{});
+        return;
+    }
+
     var session = try scanner.ScanSession.init(alloc, pid);
     defer session.deinit();
+    session.cfg.epsilon = epsilon;
+    session.cfg.writable_only = !pa.opts.contains("all");
 
     // Check if a first scan was previously done (temp files exist)
     var scan0_buf: [128]u8 = undefined;
@@ -237,7 +258,6 @@ fn runScan(pid: u32, pa: *const cli.ParsedArgs) !void {
 }
 
 fn runScanImpl(pid: u32, pa: *const cli.ParsedArgs, session: *scanner.ScanSession, opt: scanner.types.ScanOption, value_type: mem_types.TypeId, value1: u64, value2: u64, is_next: bool, max_mem: u32) !void {
-    _ = pid;
     _ = pa;
     session.cfg.max_memory_mb = max_mem;
 
@@ -251,15 +271,25 @@ fn runScanImpl(pid: u32, pa: *const cli.ParsedArgs, session: *scanner.ScanSessio
             return;
         }
         std.debug.print("Next scan: {s}...\n", .{@tagName(opt)});
-        const results = try session.nextScan(arena, opt, value1);
+        const results = try session.nextScan(arena, opt, value1, value2);
         std.debug.print("Found {d} results.\n", .{results.len});
-        for (results) |r| {
+        const show = @min(results.len, 100);
+        for (results[0..show]) |r| {
             const val_str = mem_types.formatU64(r.value, value_type, arena) catch "?";
             std.debug.print("  0x{x}: {s}\n", .{ r.address, val_str });
+        }
+        if (results.len > 100) {
+            std.debug.print("  ... and {d} more\n", .{results.len - 100});
         }
     } else {
         std.debug.print("First scan: {s}...\n", .{@tagName(opt)});
         const results = try session.firstScan(arena, opt, value_type, value1, value2);
+        if (session.used_snapshot) {
+            std.debug.print("Snapshot saved: {d} bytes scanned.\n", .{session.last_scanned});
+            std.debug.print("Run a next scan to narrow the results, e.g.:\n", .{});
+            std.debug.print("  zigh scan --pid {d} --next --option changed\n", .{pid});
+            return;
+        }
         std.debug.print("Found {d} results.\n", .{results.len});
         const show = @min(results.len, 100);
         for (results[0..show]) |r| {
@@ -427,4 +457,9 @@ fn cmdViaSocket(pa: *const cli.ParsedArgs) !void {
         .scan => std.debug.print("scan: handled standalone\n", .{}),
         else => unreachable,
     }
+}
+
+test {
+    _ = @import("scanner/value.zig");
+    _ = @import("scanner/mod.zig");
 }

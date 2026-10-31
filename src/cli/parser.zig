@@ -61,7 +61,7 @@ pub const Command = enum {
             .@"cheat-start" => "zigh cheat-start [<name>]          — Activate cheats",
             .@"cheat-stop" => "zigh cheat-stop                    — Deactivate all cheats",
             .inject => "zigh inject <pid> <agent.so>       — Inject agent into process",
-            .scan => "zigh scan [--pid <id>] [--value <n>] [--type <t>] [--option <opt>] [--max-memory <MB>] — Memory scanner",
+            .scan => "zigh scan [--pid <id>] [--value <n>] [--type <t>] [--option <opt>] [--max-memory <MB>] [--all] — Memory scanner",
         };
     }
 };
